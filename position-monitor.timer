@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Position Monitor every 30 minutes during market hours
+
+[Timer]
+# Run every 30 minutes on weekdays (market hours check is in the script)
+OnCalendar=Mon-Fri *:00,30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

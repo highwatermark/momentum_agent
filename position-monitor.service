@@ -1,0 +1,15 @@
+[Unit]
+Description=Position Monitor - Reversal Signal Detection
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/momentum-agent
+Environment="PATH=/home/ubuntu/momentum-agent/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/ubuntu/momentum-agent/venv/bin/python /home/ubuntu/momentum-agent/monitor.py
+StandardOutput=append:/home/ubuntu/momentum-agent/logs/monitor.log
+StandardError=append:/home/ubuntu/momentum-agent/logs/monitor.log
+
+[Install]
+WantedBy=multi-user.target
