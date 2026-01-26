@@ -23,11 +23,12 @@ Every decision must have clear reasoning.
 ### Entry Criteria
 - Buy stocks showing momentum breakouts (gap + volume + follow-through)
 - Prioritize: Score >= 12, Volume surge > 1.5x, Clear breakout pattern
+- **CRITICAL: RSI must be < 70** - Do NOT buy overbought stocks (RSI >= 70)
 - Strong conviction entries only - quality over quantity
 
 ### Exit Criteria
 - Sell when momentum fades (reversal signals) or target reached
-- Protect gains aggressively - don't let winners become losers
+- **LET WINNERS RUN** - Don't cut winners prematurely
 - Cut losses quickly when thesis breaks
 
 ### Risk Management
@@ -41,43 +42,56 @@ Every decision must have clear reasoning.
 
 1. **ACCOUNT STATUS**: Equity, buying power, current exposure %
 2. **OPEN POSITIONS**: Symbol, entry price, current P/L %, days held, reversal score (0-13)
-3. **NEW CANDIDATES**: Fresh momentum breakout candidates from scanner
+3. **NEW CANDIDATES**: Fresh momentum breakout candidates from scanner (RSI included)
 4. **WATCHLIST**: Previously flagged stocks to monitor
 5. **TRADE HISTORY**: Recent wins/losses for pattern recognition
 
 ## YOUR DECISIONS
 
 ### For OPEN POSITIONS - decide: HOLD or CLOSE
+
+**MINIMUM HOLD TIME RULE (CRITICAL):**
+- Do NOT close positions on the SAME DAY as entry unless P/L < -5%
+- Momentum trades need time to develop - same-day exits destroy performance
+
 **CLOSE if:**
 - Reversal score >= 5 (momentum clearly fading)
-- P/L > +15% (take profit, protect gains)
-- P/L < -3% AND reversal score >= 3 (thesis breaking, cut early)
-- Held > 10 days with P/L between -2% and +3% (dead money, opportunity cost)
+- P/L > +20% (take profit on exceptional gains)
+- P/L < -5% (stop loss triggered regardless of hold time)
+- P/L < -3% AND reversal score >= 4 AND held >= 2 days (thesis breaking)
+- Held > 10 days with P/L between -2% and +3% (dead money)
 
-**HOLD if:**
-- Momentum intact (reversal score < 3)
-- Trending well, let winner run
-- Clear reason to stay in trade
+**HOLD if (DEFAULT - prefer holding):**
+- Held < 3 days - let the trade develop unless P/L < -5%
+- P/L between +5% and +20% - let winner run, don't cut early
+- Reversal score < 4 - momentum still intact
+- Position is working (P/L > 0) - stay with the trend
+
+**IMPORTANT: Do NOT exit winning positions (+5% to +20%) just because you see a "failed breakout" pattern. Winners should run. The 5% trailing stop protects downside.**
 
 ### For CANDIDATES - decide: BUY, WATCH, or SKIP
+
+**CRITICAL: You can ONLY recommend stocks from the NEW CANDIDATES list below.**
+Do NOT recommend stocks from watchlist or previous scans - only current scan candidates.
+
 **BUY if:**
 - Score >= 12 AND momentum_breakout = True
+- **RSI < 70** (NOT overbought) - this is mandatory
 - NOT already holding the symbol
 - Have available position slot (< 6 total, < 2 in same cap category)
 - High conviction: gap > 2% OR breakout with volume > 2x
-- Clear catalyst or momentum driver
 
 **WATCH if:**
-- Good setup but not quite ready (score 8-11)
+- Good setup but RSI between 65-70 (approaching overbought)
+- Score 8-11 (not quite ready)
 - Already at max positions - queue for next slot
-- Want to see follow-through before entry
-- Interesting but needs confirmation
 
 **SKIP if:**
+- **RSI >= 70** (overbought - high reversal risk)
 - Weak setup (score < 8)
 - Poor risk/reward
 - Already holding
-- Low conviction
+- NOT in current candidates list
 
 ### For WATCHLIST - decide: PROMOTE, KEEP, or REMOVE
 **PROMOTE to BUY if:**
@@ -186,7 +200,13 @@ def format_positions_for_prompt(positions: list, reversal_scores: dict = None) -
 
     reversal_scores = reversal_scores or {}
 
+    # Get entry dates from database for days held calculation
+    from db import get_trade_by_symbol
+    from datetime import datetime
+
     lines = ["## OPEN POSITIONS\n"]
+    lines.append("**Remember: Do NOT close positions held < 1 day unless P/L < -5%**\n")
+
     for p in positions:
         symbol = p['symbol']
         pnl_pct = p.get('unrealized_plpc', 0) * 100
@@ -194,10 +214,23 @@ def format_positions_for_prompt(positions: list, reversal_scores: dict = None) -
         rev_score = reversal_scores.get(symbol, {}).get('score', 0)
         rev_signals = reversal_scores.get(symbol, {}).get('signals', [])
 
-        lines.append(f"**{symbol}** {pnl_emoji}")
+        # Calculate days held
+        days_held = 0
+        try:
+            trade = get_trade_by_symbol(symbol, status='open')
+            if trade and trade.get('entry_date'):
+                entry_date = datetime.fromisoformat(trade['entry_date'][:10])
+                days_held = (datetime.now() - entry_date).days
+        except:
+            pass
+
+        hold_warning = "⚠️ SAME DAY - hold unless -5%" if days_held == 0 else ""
+
+        lines.append(f"**{symbol}** {pnl_emoji} {hold_warning}")
         lines.append(f"  - Entry: ${p.get('avg_entry_price', 0):.2f}")
         lines.append(f"  - Current: ${p.get('current_price', 0):.2f}")
         lines.append(f"  - P/L: {pnl_pct:+.2f}% (${p.get('unrealized_pl', 0):+.2f})")
+        lines.append(f"  - **Days Held: {days_held}**")
         lines.append(f"  - Shares: {p.get('qty', 0)}")
         lines.append(f"  - Market Value: ${p.get('market_value', 0):,.2f}")
         lines.append(f"  - Reversal Score: {rev_score}/13")
@@ -214,10 +247,15 @@ def format_candidates_for_prompt(candidates: list) -> str:
         return "## NEW CANDIDATES\nNo new candidates from scanner.\n"
 
     lines = ["## NEW CANDIDATES\n"]
+    lines.append("**Remember: You can ONLY recommend BUY for stocks listed here. RSI must be < 70.**\n")
+
     for c in candidates:
         breakout_status = "✅ BREAKOUT" if c.get('momentum_breakout') else "⏳ No breakout"
+        rsi = c.get('rsi_14', 50)
+        rsi_warning = "⚠️ OVERBOUGHT" if rsi >= 70 else ("⚡ HIGH" if rsi >= 65 else "")
 
         lines.append(f"**{c['symbol']}** (${c['price']:.2f}) - Score: {c['composite_score']}/20 {breakout_status}")
+        lines.append(f"  - **RSI: {rsi:.1f}** {rsi_warning}")
         lines.append(f"  - SMA Aligned: {c['sma_aligned']}")
         lines.append(f"  - Volume Surge: {c['volume_surge']}x")
         lines.append(f"  - Gap Up: {c.get('gap_up', 0):+.2f}%")

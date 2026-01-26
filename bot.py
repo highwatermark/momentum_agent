@@ -34,7 +34,11 @@ from db import (
     get_monthly_metrics,
     export_trades_csv,
     export_candidates_csv,
-    get_poor_signal_summary
+    get_poor_signal_summary,
+    get_recent_errors,
+    get_error_summary,
+    log_error,
+    get_recent_scan_decisions
 )
 from config import get_runtime_config, set_runtime_config, MONITOR_CONFIG
 
@@ -119,7 +123,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/history - Trade history\n"
         "/performance - Signal stats\n"
         "/export - Export data to CSV\n\n"
-        "/error - Show recent errors\n\n"
+        "*Diagnostics:*\n"
+        "/error - Show recent errors (from logs)\n"
+        "/errorstatus - Detailed error analysis (from DB)\n"
+        "/scandecisions - Recent scan decisions\n\n"
         "*Settings:*\n"
         "/settings - View monitor settings\n"
         "/set - Change settings\n"
@@ -279,6 +286,119 @@ async def cmd_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"[{source}] `{error}`\n\n"
 
     await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+@admin_only
+async def cmd_errorstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show detailed error analysis from database"""
+    try:
+        # Get error summary
+        summary = get_error_summary(days=7)
+
+        msg = "📋 *Error Status (Last 7 Days)*\n\n"
+        msg += f"Total Errors: {summary['total_errors']}\n"
+        msg += f"Unresolved: {summary['unresolved']}\n\n"
+
+        if summary['by_type']:
+            msg += "*By Type:*\n"
+            for error_type, count in summary['by_type'].items():
+                msg += f"  • {error_type}: {count}\n"
+            msg += "\n"
+
+        if summary['by_operation']:
+            msg += "*By Operation:*\n"
+            for op, count in summary['by_operation'].items():
+                msg += f"  • {op}: {count}\n"
+            msg += "\n"
+
+        if summary['common_errors']:
+            msg += "*Most Common:*\n"
+            for error_msg, count in summary['common_errors'][:3]:
+                truncated = error_msg[:60] + "..." if len(error_msg) > 60 else error_msg
+                msg += f"  • ({count}x) `{truncated}`\n"
+            msg += "\n"
+
+        # Get recent errors with details
+        recent = get_recent_errors(limit=5)
+        if recent:
+            msg += "*Recent Errors:*\n"
+            for err in recent:
+                timestamp = err['timestamp'][:16] if err['timestamp'] else 'N/A'
+                symbol = f" [{err['symbol']}]" if err['symbol'] else ""
+                msg += f"\n`{timestamp}`{symbol}\n"
+                msg += f"  Type: {err['error_type']} | Op: {err['operation']}\n"
+                msg += f"  {err['error_message'][:100]}\n"
+
+        if summary['total_errors'] == 0:
+            msg = "✅ *No errors in the last 7 days!*"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error fetching error status: {e}")
+
+
+@admin_only
+async def cmd_scandecisions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show recent scan decisions"""
+    try:
+        decisions = get_recent_scan_decisions(limit=5)
+
+        if not decisions:
+            await update.message.reply_text("No scan decisions recorded yet.")
+            return
+
+        msg = "📊 *Recent Scan Decisions*\n\n"
+
+        for d in decisions:
+            timestamp = d['timestamp'][:16] if d['timestamp'] else 'N/A'
+            cap = d['cap_category'].upper() if d['cap_category'] else 'ALL'
+            scan_type = d['scan_type'] or 'unknown'
+
+            msg += f"*{timestamp}* ({cap} - {scan_type})\n"
+            msg += f"  Stage1: {d['stage1_count']} → Stage2: {d['stage2_count']}\n"
+
+            # Show filter breakdown
+            filters = []
+            if d['filtered_by_rsi'] and d['filtered_by_rsi'] > 0:
+                filters.append(f"RSI:{d['filtered_by_rsi']}")
+            if d['filtered_by_breakout'] and d['filtered_by_breakout'] > 0:
+                filters.append(f"Breakout:{d['filtered_by_breakout']}")
+            if d['filtered_by_volume'] and d['filtered_by_volume'] > 0:
+                filters.append(f"Vol:{d['filtered_by_volume']}")
+            if d['filtered_by_momentum'] and d['filtered_by_momentum'] > 0:
+                filters.append(f"Mom:{d['filtered_by_momentum']}")
+            if filters:
+                msg += f"  Filtered: {', '.join(filters)}\n"
+
+            # Show agent actions
+            try:
+                buys = json.loads(d['agent_buys']) if d['agent_buys'] else []
+                watches = json.loads(d['agent_watches']) if d['agent_watches'] else []
+                if buys:
+                    msg += f"  🟢 BUY: {', '.join(buys)}\n"
+                if watches:
+                    msg += f"  👀 WATCH: {', '.join(watches[:3])}\n"
+            except:
+                pass
+
+            # Show execution results
+            try:
+                executed = json.loads(d['executed_buys']) if d['executed_buys'] else []
+                failed = json.loads(d['failed_buys']) if d['failed_buys'] else []
+                if executed:
+                    msg += f"  ✅ Executed: {', '.join(executed)}\n"
+                if failed:
+                    msg += f"  ❌ Failed: {', '.join(failed)}\n"
+            except:
+                pass
+
+            msg += "\n"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error fetching scan decisions: {e}")
 
 
 @admin_only
@@ -817,6 +937,8 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("error", cmd_error))
+    app.add_handler(CommandHandler("errorstatus", cmd_errorstatus))
+    app.add_handler(CommandHandler("scandecisions", cmd_scandecisions))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("status", cmd_status))

@@ -97,10 +97,25 @@ def update_outcomes():
     """
     Run daily - fill in 1d/5d/10d prices for past candidates.
     This data is used for DQL training to evaluate skipped trades.
+
+    Should be run 1+ hour after market close (21:00 UTC = 4 PM ET)
+    for reliable price data.
     """
     from db import update_candidate_outcomes
+    import pytz
 
     print(f"[{datetime.now()}] Updating candidate outcomes...")
+
+    # Check if market has been closed for at least 30 minutes
+    et = pytz.timezone('America/New_York')
+    now_et = datetime.now(et)
+    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+
+    if now_et.weekday() < 5:  # Weekday
+        minutes_since_close = (now_et - market_close).total_seconds() / 60
+        if 0 < minutes_since_close < 30:
+            print(f"  Market closed {minutes_since_close:.0f} minutes ago - waiting for data to settle")
+            print(f"  Recommend running this job at 22:00+ UTC (5 PM+ ET)")
 
     try:
         data_client = get_data_client()

@@ -463,19 +463,48 @@ def run_scan(scan_type: str = 'scheduled', log_candidates: bool = True, cap: str
     min_gap_up = cap_config["min_gap_up"] * 100  # Convert to percentage
     min_roc_10d = cap_config["min_roc_10d"] * 100  # Convert to percentage
 
-    print(f"  Thresholds: gap>={min_gap_up:.1f}%, vol>={min_volume_surge}x, roc>={min_roc_10d:.1f}%")
+    print(f"  Thresholds: gap>={min_gap_up:.1f}%, vol>={min_volume_surge}x, roc>={min_roc_10d:.1f}%, RSI<70")
 
     # Filter by minimum criteria
     # Momentum breakout: gap+follow-through OR 5D breakout, with volume confirmation
+    # RSI < 70: Avoid overbought stocks (high reversal risk)
     filtered = []
+
+    # Track filter statistics for logging
+    filter_stats = {
+        'stage1_count': len(stage1_candidates),
+        'stage2_analyzed': len(all_results),
+        'filtered_by_breakout': 0,
+        'filtered_by_volume': 0,
+        'filtered_by_momentum': 0,
+        'filtered_by_rsi': 0,
+        'rsi_blocked_stocks': []  # Track which stocks were blocked by RSI
+    }
+
     for r in all_results:
         # Use cap-specific gap threshold for breakout detection
         gap_breakout = r["gap_up"] >= min_gap_up and r["follow_through"]
         breakout = gap_breakout or r["breakout_5d"]
         volume_ok = r["volume_surge"] >= min_volume_surge
         momentum_ok = r["roc_10d"] >= min_roc_10d
+        rsi_ok = r.get("rsi_14", 50) < 70  # CRITICAL: Filter out overbought stocks
 
-        passes_filter = breakout and volume_ok and momentum_ok
+        # Track filter failures
+        if not breakout:
+            filter_stats['filtered_by_breakout'] += 1
+        if not volume_ok:
+            filter_stats['filtered_by_volume'] += 1
+        if not momentum_ok:
+            filter_stats['filtered_by_momentum'] += 1
+        if not rsi_ok:
+            filter_stats['filtered_by_rsi'] += 1
+            filter_stats['rsi_blocked_stocks'].append({
+                'symbol': r['symbol'],
+                'rsi': r.get('rsi_14', 0),
+                'score': r.get('composite_score', 0)
+            })
+
+        passes_filter = breakout and volume_ok and momentum_ok and rsi_ok
 
         if passes_filter:
             filtered.append(r)
@@ -493,6 +522,8 @@ def run_scan(scan_type: str = 'scheduled', log_candidates: bool = True, cap: str
                     skip_reason.append(f"low_volume({r['volume_surge']:.1f}x)")
                 if not momentum_ok:
                     skip_reason.append(f"weak_momentum({r['roc_10d']:.1f}%)")
+                if not rsi_ok:
+                    skip_reason.append(f"overbought(RSI={r.get('rsi_14', 0):.0f})")
 
             log_candidate(
                 scan_id=scan_id,
@@ -504,12 +535,32 @@ def run_scan(scan_type: str = 'scheduled', log_candidates: bool = True, cap: str
 
     # Sort by composite score (descending)
     filtered.sort(key=lambda x: x["composite_score"], reverse=True)
+    filter_stats['stage2_count'] = len(filtered)
+    filter_stats['candidates_presented'] = min(len(filtered), 10)
 
     print(f"Stage 2 results: {len(filtered)} stocks passed all filters")
+    if filter_stats['filtered_by_rsi'] > 0:
+        print(f"  RSI filter blocked: {filter_stats['filtered_by_rsi']} stocks (RSI >= 70)")
+        for blocked in filter_stats['rsi_blocked_stocks'][:3]:
+            print(f"    - {blocked['symbol']}: RSI={blocked['rsi']:.0f}, Score={blocked['score']}")
     if log_candidates:
         print(f"  Logged {len(all_results)} candidates for DQL training")
 
+    # Store filter_stats in module-level variable for access by main.py
+    global last_filter_stats
+    last_filter_stats = filter_stats
+
     return filtered[:10]  # Return top 10
+
+
+# Module-level variable to store last filter stats
+last_filter_stats = {}
+
+
+def get_last_filter_stats() -> dict:
+    """Get filter statistics from the last scan"""
+    global last_filter_stats
+    return last_filter_stats
 
 
 def run_scan_simple() -> list[dict]:

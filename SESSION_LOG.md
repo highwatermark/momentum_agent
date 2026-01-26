@@ -2,6 +2,467 @@
 
 ---
 
+## Session 12: DQN Backfill & Data-Driven Prompt Review (January 20, 2026)
+
+### Overview
+
+Backfilled the DQN experiences table from trade history and performed comprehensive data analysis to identify prompt improvements based on actual trade outcomes.
+
+### DQN Experience Backfill
+
+Created `dqn_experiences` table and backfilled all 22 closed trades with:
+- 18-feature normalized state vectors
+- Calculated reward values
+- Market context (VIX, SPY trend)
+- Portfolio state
+
+**New DB Functions Added:**
+| Function | Purpose |
+|----------|---------|
+| `backfill_dqn_experiences()` | Populate table from trade history |
+| `get_dqn_training_data()` | Return experiences for DQN model training |
+| `get_dqn_stats()` | Summary statistics for DQN data |
+
+**DQN Stats After Backfill:**
+| Metric | Value |
+|--------|-------|
+| Total Experiences | 22 |
+| Avg Reward | -0.0483 |
+| Best Reward | +0.1337 (KTOS) |
+| Win Rate | 27.3% |
+
+### Comprehensive Trade Analysis
+
+**Overall Performance:**
+- Total Closed: 22 trades
+- Wins: 6 | Losses: 16
+- Win Rate: **27.3%** (critically low)
+- Total P/L: **-$595.12**
+- Avg P/L: -0.55%
+
+#### Key Finding 1: Same-Day Exits Are Catastrophic
+
+| Hold Time | Count | Avg P/L | Win Rate |
+|-----------|-------|---------|----------|
+| Same Day (0d) | 12 | **-1.61%** | **8.3%** |
+| 1+ Days | 10 | **+0.73%** | **50.0%** |
+
+**Conclusion:** Same-day exits are the #1 performance killer. The minimum hold rule must be absolute.
+
+#### Key Finding 2: RSI Filter Not Strict Enough
+
+| RSI at Entry | Count | Avg P/L | Win Rate |
+|--------------|-------|---------|----------|
+| 80+ | 10 | -0.37% | 20.0% |
+| 70-79 | 7 | -0.39% | 42.9% |
+| 60-69 | 5 | -1.12% | 20.0% |
+
+Despite RSI < 70 rule being added, 17/22 trades entered with RSI 70+.
+
+**Candidate Outcome Data (next-day returns):**
+| RSI Group | Candidates | Up Next Day | Avg Return |
+|-----------|------------|-------------|------------|
+| RSI < 70 | 358 | 50.3% | **+0.16%** |
+| RSI > 70 | 225 | 40.0% | **-0.57%** |
+
+**Conclusion:** RSI > 70 stocks significantly underperform. Need enforcement at scanner level.
+
+#### Key Finding 3: Holding Period Matters
+
+| Days Held | Count | Avg P/L | Win Rate |
+|-----------|-------|---------|----------|
+| 0 | 12 | -1.61% | 8.3% |
+| 1 | 6 | -1.00% | 50.0% |
+| 2 | 1 | +3.81% | 100% |
+| 3 | 1 | -0.68% | 0% |
+| 4 | 2 | +5.06% | 50% |
+
+**Winners:** KTOS (4d, +10.59%), RKLB (2d, +3.81%), MU (1d, +2.15%)
+**Losers:** ONDS (0d, -5.06%), WDC (1d, -4.64%), UUUU (0d, -4.11%)
+
+**Conclusion:** Winners are held 2-4 days. Losers often exited same-day.
+
+### Recommended Prompt & Scanner Updates
+
+#### HIGH PRIORITY - Enforce RSI < 70 at Scanner Level
+
+**Current State:** RSI filter only in agent prompt (advisory)
+**Recommendation:** Add hard filter in `scanner.py` to exclude RSI >= 70 before candidates reach agent
+
+```python
+# In scanner.py Stage 2 filter
+if rsi_14 >= 70:
+    skip_reason = f"RSI overbought ({rsi_14:.0f})"
+    continue  # Don't include in candidates
+```
+
+**Expected Impact:** Prevents agent from even seeing overbought stocks, removing temptation.
+
+#### HIGH PRIORITY - Absolute Minimum Hold Rule
+
+**Current Rule:** "Do NOT close on same day unless P/L < -5%"
+**Problem:** Agent still closed 12 trades same-day
+**Recommendation:** Remove the -5% exception for day 0
+
+```
+MINIMUM HOLD RULE (ABSOLUTE):
+- Day 0: NEVER close. No exceptions. Let the trailing stop do its job.
+- Day 1: Only close if P/L < -5%
+- Day 2+: Normal exit criteria apply
+```
+
+**Expected Impact:** Eliminates 8.3% win rate same-day exits, forces trades to develop.
+
+#### MEDIUM PRIORITY - Tighten RSI Entry to < 65
+
+**Current Rule:** RSI < 70
+**Recommendation:** RSI < 65 for new entries
+
+**Data Support:** RSI 70-79 bucket had -0.39% avg P/L, only slightly better than 80+
+
+```
+BUY if:
+- RSI < 65 (NOT approaching overbought)
+- RSI 65-70: WATCH only (wait for pullback)
+```
+
+#### MEDIUM PRIORITY - Increase Volume Requirement
+
+**Observation:** Winners had stronger volume
+**Recommendation:** Increase minimum volume surge from 1.5x to 2.0x
+
+```
+BUY if:
+- Volume surge >= 2.0x (was 1.5x)
+```
+
+#### LOW PRIORITY - 2-Day Evaluation Rule
+
+**Recommendation:** Don't evaluate exit criteria until day 2
+
+```
+EXIT EVALUATION:
+- Days 0-1: NO exit evaluation (trailing stop only protection)
+- Day 2+: Evaluate reversal score, dead money, thesis break
+```
+
+### Implementation Priority
+
+| Priority | Change | File | Expected Impact |
+|----------|--------|------|-----------------|
+| 1 | RSI < 70 hard filter in scanner | scanner.py | Prevent overbought entries |
+| 2 | Absolute no-exit rule for day 0 | agent.py | Eliminate same-day exits |
+| 3 | RSI < 65 for BUY, 65-70 WATCH | agent.py | Better entry timing |
+| 4 | Volume >= 2.0x requirement | agent.py | Higher quality entries |
+| 5 | 2-day evaluation delay | agent.py | Let trades develop |
+
+### RSI Hard Filter Implementation
+
+**Added RSI < 70 enforcement at scanner level** (not just advisory in prompt).
+
+**Change in `scanner.py` (lines 466-498):**
+```python
+# Added RSI filter
+rsi_ok = r.get("rsi_14", 50) < 70  # CRITICAL: Filter out overbought stocks
+passes_filter = breakout and volume_ok and momentum_ok and rsi_ok
+
+# Added to skip_reason logging
+if not rsi_ok:
+    skip_reason.append(f"overbought(RSI={r.get('rsi_14', 0):.0f})")
+```
+
+**Test Results:**
+```
+Stocks blocked by RSI filter:
+  COST: RSI=81.5, Score=19 <- BLOCKED
+  LMT: RSI=81.0, Score=14 <- BLOCKED
+  HON: RSI=79.4, Score=19 <- BLOCKED
+  RTX: RSI=78.3, Score=12 <- BLOCKED
+  MU: RSI=74.3, Score=19 <- BLOCKED
+```
+
+These high-scoring but overbought stocks will no longer reach the agent.
+
+### Comprehensive Logging Implementation
+
+Added full error tracking and scan decision logging to database.
+
+**New Database Tables:**
+
+1. **`error_log`** - Tracks all errors with context
+   - error_type: 'scan', 'trade', 'monitor', 'api', 'system'
+   - operation: what was attempted
+   - symbol, error_message, error_details
+   - context: JSON with relevant state
+   - resolved flag and resolution_notes
+
+2. **`scan_decisions`** - Tracks agent decisions with reasoning
+   - Filter stats (stage1/2 counts, filtered_by_rsi, etc.)
+   - Agent actions (buys, watches, skips)
+   - Execution results (executed, failed, errors)
+
+**New Bot Commands:**
+
+| Command | Description |
+|---------|-------------|
+| `/errorstatus` | Detailed error analysis from DB (by type, operation, common errors) |
+| `/scandecisions` | Recent scan decisions with filter breakdown |
+
+**Error Logging Added To:**
+- `executor.py`: Trade buy/sell errors with full context
+- `scanner.py`: Filter statistics tracking (RSI blocked count, etc.)
+
+### Files Modified This Session
+
+| File | Changes |
+|------|---------|
+| `db.py` | Added `dqn_experiences` table, `error_log` table, `scan_decisions` table, `log_error()`, `get_recent_errors()`, `get_error_summary()`, `log_scan_decision()`, `get_recent_scan_decisions()` |
+| `scanner.py` | Added RSI < 70 hard filter, filter statistics tracking, `get_last_filter_stats()` |
+| `executor.py` | Added error logging to `execute_trade()` and `close_position()` |
+| `bot.py` | Added `/errorstatus` and `/scandecisions` commands |
+
+### Verification for Tomorrow's Run
+
+The scanner now enforces:
+1. **RSI < 70** - Hard filter at scanner level (overbought stocks never reach agent)
+2. Breakout pattern (gap + follow-through OR 5D breakout)
+3. Volume surge >= 1.3x (1.5x for small caps)
+4. ROC 10D >= 3% (5% for small caps)
+
+### Next Steps
+
+1. ~~Implement RSI hard filter in scanner.py~~ ✓ DONE
+2. Monitor tomorrow's scan to verify RSI filter working in production
+3. Consider making day-0 no-exit rule absolute (remove -5% exception)
+4. Re-run DQN backfill after more trades accumulate
+
+---
+
+## Session 11: Performance Analysis & Critical Fixes (January 20, 2026)
+
+### Overview
+
+Comprehensive review identified the agent performing poorly with 27.3% win rate (6/16) and -$595 total P/L. Root cause analysis revealed multiple systemic issues that were fixed.
+
+### Performance Metrics (Pre-Fix)
+
+| Metric | Value | Assessment |
+|--------|-------|------------|
+| Win Rate | 27.3% | CRITICALLY LOW |
+| Total Closed Trades | 22 | |
+| Total P/L | -$595.12 | Negative |
+| Avg P/L per Trade | -0.55% | |
+| DQL Training Data | 0% outcome coverage | BROKEN |
+
+### Root Causes Identified
+
+1. **Agent cutting winners too early** - KTOS exited at +10.59% as "poor signal"
+2. **Same-day exits destroying performance** - Multiple trades closed day of entry
+3. **DQL training data completely broken** - 0/798 candidates with outcome data
+4. **Skip-buy mode too restrictive** - Required 6 positions (max) to activate
+5. **Entering overbought stocks** - RSI > 70 on most losing trades
+6. **Agent recommending non-candidates** - Stocks from wrong cap scans
+
+### Fixes Implemented
+
+#### Fix 1: DQL Training Pipeline (CRITICAL)
+
+**File**: `db.py` - `update_candidate_outcomes()`
+
+**Problem**: Single-symbol API calls failing with "No item with that key" right after market close.
+
+**Solution**:
+- Batch API calls (50 symbols at a time) for efficiency
+- Added fallback to historical bars API when snapshots fail
+- Added warning when running too soon after market close
+
+**Code Changes**:
+```python
+# Before: Single symbol queries
+for candidate in candidates:
+    snapshot = data_client.get_stock_snapshot(request)
+
+# After: Batched queries with fallback
+for i in range(0, len(symbols), batch_size):
+    batch = symbols[i:i + batch_size]
+    snapshots = data_client.get_stock_snapshot(request)
+    # Plus: fallback to StockBarsRequest for missing symbols
+```
+
+#### Fix 2: Minimum Hold Time Rule (CRITICAL)
+
+**File**: `agent.py` - System prompt
+
+**Problem**: Positions being closed same day as entry, destroying momentum thesis.
+
+**Solution**: Added explicit rule preventing same-day exits unless P/L < -5%.
+
+**New Rules**:
+```
+MINIMUM HOLD TIME RULE (CRITICAL):
+- Do NOT close positions on the SAME DAY as entry unless P/L < -5%
+- Momentum trades need time to develop - same-day exits destroy performance
+```
+
+#### Fix 3: Let Winners Run (CRITICAL)
+
+**File**: `agent.py` - System prompt
+
+**Problem**: Winning positions (+5% to +15%) cut early due to "failed breakout" patterns.
+
+**Solution**: Revised exit criteria to favor holding winners.
+
+**Changes**:
+| Rule | Before | After |
+|------|--------|-------|
+| Take profit | > +15% | > +20% |
+| Cut loss threshold | < -3% with rev >= 3 | < -5% (any time) OR < -3% with rev >= 4 AND held >= 2 days |
+| Winner handling | Often cut at +5-10% | HOLD if +5% to +20% - let it run |
+
+**Added Explicit Warning**:
+```
+IMPORTANT: Do NOT exit winning positions (+5% to +20%) just because
+you see a "failed breakout" pattern. Winners should run. The 5%
+trailing stop protects downside.
+```
+
+#### Fix 4: RSI Entry Filter (HIGH)
+
+**File**: `agent.py` - System prompt + `format_candidates_for_prompt()`
+
+**Problem**: Entering overbought stocks (RSI > 70) that reversed immediately.
+
+**Analysis of Losers**:
+| Symbol | Entry RSI | Result |
+|--------|-----------|--------|
+| FCX | 83.4 | -1.05% |
+| WDC | 75.2 | -4.64% |
+| ZETA | 82.9 | -1.53% |
+
+**Solution**:
+- Added mandatory RSI < 70 filter for BUY decisions
+- RSI now prominently displayed in candidate prompt
+- Visual warnings for RSI >= 65 (⚡ HIGH) and >= 70 (⚠️ OVERBOUGHT)
+
+**New Rule**:
+```
+BUY if:
+- Score >= 12 AND momentum_breakout = True
+- **RSI < 70** (NOT overbought) - this is mandatory
+```
+
+#### Fix 5: Dead Money Revision (MEDIUM)
+
+**File**: `agent.py` - System prompt
+
+**Problem**: Positions classified as "dead money" within hours of entry.
+
+**Solution**: Dead money rule only applies after 10+ days with P/L between -2% and +3%.
+
+**Clarification Added**:
+```
+HOLD if (DEFAULT - prefer holding):
+- Held < 3 days - let the trade develop unless P/L < -5%
+```
+
+#### Fix 6: Skip-Buy Threshold (MEDIUM)
+
+**File**: `config.py` - `MONITOR_CONFIG`
+
+**Problem**: `min_positions_for_skip` was 6 (max positions), meaning skip-buy mode never activated until portfolio was full.
+
+**Solution**: Reduced threshold to 4 positions.
+
+```python
+# Before
+"min_positions_for_skip": 6,  # Never activated
+
+# After
+"min_positions_for_skip": 4,  # Activates with 4+ healthy positions
+```
+
+#### Fix 7: Constrain Agent Recommendations (MEDIUM)
+
+**File**: `agent.py` - System prompt + `format_candidates_for_prompt()`
+
+**Problem**: Agent recommending HON during mid-cap scan when HON was only in large-cap candidates.
+
+**Solution**: Added explicit constraint in prompt.
+
+```
+CRITICAL: You can ONLY recommend stocks from the NEW CANDIDATES list below.
+Do NOT recommend stocks from watchlist or previous scans - only current scan candidates.
+```
+
+**Validation**: Candidates list now includes reminder header.
+
+#### Fix 8: Days Held in Position Display
+
+**File**: `agent.py` - `format_positions_for_prompt()`
+
+**Problem**: Agent couldn't see how long positions were held, leading to premature exits.
+
+**Solution**: Added days held calculation and same-day warning.
+
+```python
+lines.append(f"  - **Days Held: {days_held}**")
+hold_warning = "⚠️ SAME DAY - hold unless -5%" if days_held == 0 else ""
+```
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `db.py` | Rewrote `update_candidate_outcomes()` with batching and fallback |
+| `agent.py` | Major system prompt rewrite, added RSI display, days held calculation |
+| `config.py` | Changed `min_positions_for_skip` from 6 to 4 |
+| `jobs.py` | Added market close timing check for `update_outcomes()` |
+
+### Expected Improvements
+
+| Issue | Fix | Expected Impact |
+|-------|-----|-----------------|
+| 0% outcome data | Batched API + fallback | 90%+ coverage |
+| Same-day exits | Minimum hold rule | Eliminate churning |
+| Cutting winners | Revised exit criteria | Let +5-15% run |
+| Overbought entries | RSI < 70 filter | Fewer immediate reversals |
+| Skip-buy never activating | Threshold 6→4 | Better capital deployment |
+
+### Post-Fix Validation
+
+To validate fixes, monitor:
+```bash
+# Check DQL outcome coverage after next job run
+./venv/bin/python3 -c "
+import sqlite3
+conn = sqlite3.connect('data/trades.db')
+cursor = conn.cursor()
+cursor.execute('SELECT COUNT(*) FROM candidate_snapshots WHERE price_1d_later IS NOT NULL')
+with_outcomes = cursor.fetchone()[0]
+cursor.execute('SELECT COUNT(*) FROM candidate_snapshots')
+total = cursor.fetchone()[0]
+print(f'Outcome coverage: {with_outcomes}/{total} ({100*with_outcomes/total:.1f}%)')
+"
+
+# Run outcome update manually
+./venv/bin/python jobs.py update_outcomes
+```
+
+### Agent Prompt Changes Summary
+
+**Entry Rules**:
+- ✅ RSI < 70 mandatory
+- ✅ Only recommend from current candidates list
+- ✅ Score >= 12 with breakout
+
+**Exit Rules**:
+- ✅ No same-day exits unless P/L < -5%
+- ✅ Hold winners (+5% to +20%)
+- ✅ Reversal score >= 5 still triggers exit
+- ✅ Dead money only after 10+ days
+
+---
+
 ## Session 10: Code Review, Conflict Resolution & Self-Learning Loop (January 6, 2026)
 
 ### Overview

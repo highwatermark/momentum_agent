@@ -97,7 +97,7 @@ MONITOR_CONFIG = {
     "alert_threshold": 3,            # Reversal score to send alert
     "skip_buys_when_healthy": True,  # Skip new buys when all positions healthy
     "healthy_threshold": 3,          # Reversal score below which position is "healthy"
-    "min_positions_for_skip": 6,     # Minimum positions required before skip-buy mode activates (= max_positions)
+    "min_positions_for_skip": 4,     # Minimum positions required before skip-buy mode activates
 }
 
 

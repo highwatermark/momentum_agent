@@ -10,7 +10,7 @@ from alpaca.trading.requests import (
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, QueryOrderStatus
 from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, TRADING_CONFIG, get_cap_config
-from db import log_trade, get_trade_by_symbol, update_trade_exit, log_poor_signal
+from db import log_trade, get_trade_by_symbol, update_trade_exit, log_poor_signal, log_error
 
 
 def get_trading_client() -> TradingClient:
@@ -245,6 +245,21 @@ def place_entry_order(symbol: str, signals: dict, cap: str = None) -> dict:
         }
         
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        log_error(
+            error_type='trade',
+            operation='buy',
+            error_message=str(e),
+            symbol=symbol,
+            error_details=error_details,
+            context={
+                'price': signals.get('price'),
+                'qty': qty if 'qty' in dir() else None,
+                'score': signals.get('composite_score'),
+                'rsi': signals.get('rsi_14')
+            }
+        )
         return {
             "success": False,
             "error": str(e)
@@ -369,6 +384,19 @@ def close_position(symbol: str, reason: str = "manual", reversal_signals: list =
         }
 
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        log_error(
+            error_type='trade',
+            operation='close',
+            error_message=str(e),
+            symbol=symbol,
+            error_details=error_details,
+            context={
+                'reason': reason,
+                'reversal_signals': reversal_signals
+            }
+        )
         return {
             "success": False,
             "error": str(e)
