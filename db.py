@@ -390,6 +390,82 @@ def init_tables(conn: sqlite3.Connection):
         )
     """)
 
+    # Flow signals table (options flow from Unusual Whales)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS flow_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id TEXT UNIQUE,
+            timestamp TEXT,
+            symbol TEXT,
+            strike REAL,
+            expiration TEXT,
+            option_type TEXT,
+            premium REAL,
+            size INTEGER,
+            volume INTEGER,
+            open_interest INTEGER,
+            vol_oi_ratio REAL,
+            is_sweep INTEGER,
+            is_ask_side INTEGER,
+            is_floor INTEGER,
+            is_opening INTEGER,
+            is_otm INTEGER,
+            underlying_price REAL,
+            sentiment TEXT,
+            score INTEGER,
+            score_breakdown TEXT,
+            analyzed INTEGER DEFAULT 0,
+            recommendation TEXT,
+            conviction REAL,
+            thesis TEXT,
+            executed INTEGER DEFAULT 0,
+            raw_data TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Options trades table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS options_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contract_symbol TEXT,
+            underlying TEXT,
+            option_type TEXT,
+            strike REAL,
+            expiration TEXT,
+            entry_date TEXT,
+            entry_price REAL,
+            quantity INTEGER,
+            signal_score INTEGER,
+            signal_data TEXT,
+            thesis TEXT,
+            exit_date TEXT,
+            exit_price REAL,
+            exit_reason TEXT,
+            pnl_amount REAL,
+            pnl_pct REAL,
+            status TEXT DEFAULT 'open',
+            flow_signal_id INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (flow_signal_id) REFERENCES flow_signals(id)
+        )
+    """)
+
+    # Flow scan history
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS flow_scan_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_time TEXT,
+            filters TEXT,
+            signals_found INTEGER,
+            signals_analyzed INTEGER,
+            buy_recommendations INTEGER,
+            trades_executed INTEGER,
+            top_signals TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     conn.commit()
 
 
@@ -1969,6 +2045,288 @@ def get_dqn_stats() -> dict:
         'avg_pnl': round(row['avg_pnl'] or 0, 2),
         'avg_holding_days': round(row['avg_holding'] or 0, 1)
     }
+
+
+# ============== OPTIONS FLOW FUNCTIONS ==============
+
+def log_flow_signal(signal_data: dict) -> int:
+    """Log a flow signal from Unusual Whales"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO flow_signals (
+            signal_id, timestamp, symbol, strike, expiration, option_type,
+            premium, size, volume, open_interest, vol_oi_ratio,
+            is_sweep, is_ask_side, is_floor, is_opening, is_otm,
+            underlying_price, sentiment, score, score_breakdown, raw_data
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        signal_data.get('id'),
+        signal_data.get('timestamp'),
+        signal_data.get('symbol'),
+        signal_data.get('strike'),
+        signal_data.get('expiration'),
+        signal_data.get('option_type'),
+        signal_data.get('premium'),
+        signal_data.get('size'),
+        signal_data.get('volume'),
+        signal_data.get('open_interest'),
+        signal_data.get('vol_oi_ratio'),
+        1 if signal_data.get('is_sweep') else 0,
+        1 if signal_data.get('is_ask_side') else 0,
+        1 if signal_data.get('is_floor') else 0,
+        1 if signal_data.get('is_opening') else 0,
+        1 if signal_data.get('is_otm') else 0,
+        signal_data.get('underlying_price'),
+        signal_data.get('sentiment'),
+        signal_data.get('score'),
+        json.dumps(signal_data.get('score_breakdown', {})),
+        json.dumps(signal_data.get('raw_data', {})),
+    ))
+
+    signal_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return signal_id
+
+
+def update_flow_signal_analysis(signal_id: str, recommendation: str, conviction: float, thesis: str):
+    """Update flow signal with analysis results"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE flow_signals
+        SET analyzed = 1, recommendation = ?, conviction = ?, thesis = ?
+        WHERE signal_id = ?
+    """, (recommendation, conviction, thesis, signal_id))
+
+    conn.commit()
+    conn.close()
+
+
+def mark_flow_signal_executed(signal_id: str):
+    """Mark flow signal as executed"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE flow_signals SET executed = 1 WHERE signal_id = ?
+    """, (signal_id,))
+
+    conn.commit()
+    conn.close()
+
+
+def log_options_trade(
+    contract_symbol: str,
+    underlying: str,
+    option_type: str,
+    strike: float,
+    expiration: str,
+    quantity: int,
+    entry_price: float,
+    signal_score: int = None,
+    signal_data: dict = None,
+    thesis: str = None,
+    flow_signal_id: int = None
+) -> int:
+    """Log an options trade"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO options_trades (
+            contract_symbol, underlying, option_type, strike, expiration,
+            entry_date, entry_price, quantity, signal_score, signal_data,
+            thesis, status, flow_signal_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+    """, (
+        contract_symbol,
+        underlying,
+        option_type,
+        strike,
+        expiration,
+        datetime.now().isoformat(),
+        entry_price,
+        quantity,
+        signal_score,
+        json.dumps(signal_data) if signal_data else None,
+        thesis,
+        flow_signal_id,
+    ))
+
+    trade_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return trade_id
+
+
+def update_options_trade_exit(trade_id: int, exit_price: float, exit_reason: str):
+    """Update options trade with exit info"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Get entry info for P/L calculation
+    cursor.execute("SELECT entry_price, quantity FROM options_trades WHERE id = ?", (trade_id,))
+    row = cursor.fetchone()
+
+    if row:
+        entry_price = row['entry_price']
+        quantity = row['quantity']
+        # Options P/L: (exit - entry) * quantity * 100 (100 shares per contract)
+        pnl_amount = (exit_price - entry_price) * quantity * 100
+        pnl_pct = ((exit_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+
+        cursor.execute("""
+            UPDATE options_trades
+            SET exit_date = ?, exit_price = ?, exit_reason = ?,
+                pnl_amount = ?, pnl_pct = ?, status = 'closed'
+            WHERE id = ?
+        """, (
+            datetime.now().isoformat(),
+            exit_price,
+            exit_reason,
+            pnl_amount,
+            pnl_pct,
+            trade_id,
+        ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_options_trade_by_id(trade_id: int) -> dict:
+    """Get options trade by ID"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM options_trades WHERE id = ?", (trade_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    return dict(row) if row else None
+
+
+def get_options_trade_by_contract(contract_symbol: str, status: str = 'open') -> dict:
+    """Get options trade by contract symbol"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT * FROM options_trades
+        WHERE contract_symbol = ? AND status = ?
+        ORDER BY entry_date DESC LIMIT 1
+    """, (contract_symbol, status))
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return dict(row) if row else None
+
+
+def get_open_options_trades() -> list:
+    """Get all open options trades"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM options_trades WHERE status = 'open'")
+    trades = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    return trades
+
+
+def get_recent_options_trades(limit: int = 20) -> list:
+    """Get recent options trades"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT * FROM options_trades
+        ORDER BY entry_date DESC
+        LIMIT ?
+    """, (limit,))
+
+    trades = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    return trades
+
+
+def get_options_performance() -> dict:
+    """Get options trading performance statistics"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            COUNT(*) as total_trades,
+            SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) as open_trades,
+            SUM(CASE WHEN status = 'closed' AND pnl_pct > 0 THEN 1 ELSE 0 END) as wins,
+            SUM(CASE WHEN status = 'closed' AND pnl_pct <= 0 THEN 1 ELSE 0 END) as losses,
+            AVG(CASE WHEN status = 'closed' AND pnl_pct > 0 THEN pnl_pct ELSE NULL END) as avg_win,
+            AVG(CASE WHEN status = 'closed' AND pnl_pct <= 0 THEN pnl_pct ELSE NULL END) as avg_loss,
+            SUM(CASE WHEN status = 'closed' THEN pnl_amount ELSE 0 END) as total_pnl
+        FROM options_trades
+    """)
+
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row or row['total_trades'] == 0:
+        return {
+            'total_trades': 0,
+            'open_trades': 0,
+            'win_rate': 0,
+            'avg_win': 0,
+            'avg_loss': 0,
+            'total_pnl': 0,
+        }
+
+    closed_trades = (row['wins'] or 0) + (row['losses'] or 0)
+    win_rate = round((row['wins'] or 0) / closed_trades * 100, 1) if closed_trades > 0 else 0
+
+    return {
+        'total_trades': row['total_trades'],
+        'open_trades': row['open_trades'] or 0,
+        'win_rate': win_rate,
+        'avg_win': round(row['avg_win'] or 0, 1),
+        'avg_loss': round(row['avg_loss'] or 0, 1),
+        'total_pnl': round(row['total_pnl'] or 0, 2),
+    }
+
+
+def log_flow_scan_history(
+    filters: dict,
+    signals_found: int,
+    signals_analyzed: int,
+    buy_recommendations: int,
+    trades_executed: int,
+    top_signals: list
+):
+    """Log flow scan history"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO flow_scan_history (
+            scan_time, filters, signals_found, signals_analyzed,
+            buy_recommendations, trades_executed, top_signals
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        datetime.now().isoformat(),
+        json.dumps(filters),
+        signals_found,
+        signals_analyzed,
+        buy_recommendations,
+        trades_executed,
+        json.dumps(top_signals[:10]) if top_signals else '[]',
+    ))
+
+    conn.commit()
+    conn.close()
 
 
 if __name__ == "__main__":

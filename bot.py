@@ -62,6 +62,13 @@ last_scan_results = {
     "decision": None
 }
 
+# Store last flow results
+last_flow_results = {
+    "timestamp": None,
+    "signals": [],
+    "analyzed": []
+}
+
 
 def admin_only(func):
     """Decorator to restrict commands to admin only"""
@@ -108,7 +115,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command - show welcome message"""
     await update.message.reply_text(
         "🤖 *Momentum Agent Active*\n\n"
-        "*Trading:*\n"
+        "*Stock Trading:*\n"
         "/status - Account overview\n"
         "/scan - Run momentum scan\n"
         "/candidates - Last scan results\n"
@@ -116,6 +123,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/close SYMBOL - Close position\n"
         "/positions - Current positions\n"
         "/orders - Open orders\n\n"
+        "*Options Flow:*\n"
+        "/flow - Scan options flow\n"
+        "/analyze - Analyze with Claude\n"
+        "/options - Options positions\n"
+        "/buyoption SYMBOL - Buy option\n"
+        "/closeoption CONTRACT - Close option\n\n"
         "*Analytics:*\n"
         "/metrics - Baseline performance\n"
         "/weekly - Last 7 days report\n"
@@ -887,6 +900,230 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 
+# ============== OPTIONS FLOW COMMANDS ==============
+
+@admin_only
+async def cmd_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run options flow scan"""
+    global last_flow_results
+
+    await update.message.reply_text("⏳ Scanning options flow...")
+
+    try:
+        from flow_scanner import run_flow_scan, get_flow_summary
+
+        signals = run_flow_scan(
+            min_premium=100000,
+            min_vol_oi=1.0,
+            min_score=8,
+            limit=50,
+        )
+
+        if not signals:
+            last_flow_results = {"timestamp": datetime.now().isoformat(), "signals": [], "analyzed": []}
+            await update.message.reply_text("📭 No high-conviction flow signals found.")
+            return
+
+        # Store for later execution
+        last_flow_results = {"timestamp": datetime.now().isoformat(), "signals": signals, "analyzed": []}
+
+        summary = get_flow_summary(signals)
+
+        msg = f"✅ *Flow Scan Complete*\n"
+        msg += f"Found {summary['count']} signals (score >= 8)\n\n"
+        msg += f"*Summary:*\n"
+        msg += f"├── Total Premium: ${summary['total_premium']:,.0f}\n"
+        msg += f"├── Bullish: {summary['bullish_count']} | Bearish: {summary['bearish_count']}\n"
+        msg += f"├── Sweeps: {summary['sweeps']} | Floor: {summary['floor_trades']}\n"
+        msg += f"└── Avg Score: {summary['avg_score']:.1f}\n\n"
+
+        msg += "*Top 5 Signals:*\n"
+        for i, s in enumerate(signals[:5], 1):
+            emoji = "📈" if s.sentiment == "bullish" else "📉"
+            msg += f"\n{i}. {emoji} *{s.symbol}* {s.option_type.upper()} ${s.strike}\n"
+            msg += f"   ${s.premium:,.0f} | Score: {s.score} | Vol/OI: {s.vol_oi_ratio}x\n"
+
+        msg += f"\n\nUse `/analyze` to generate theses or `/buyoption SYMBOL` to trade"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Flow scan error: {e}")
+        await update.message.reply_text(f"❌ Flow scan failed: {str(e)}")
+
+
+@admin_only
+async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Analyze top flow signals with Claude"""
+    global last_flow_results
+
+    if not last_flow_results.get("signals"):
+        await update.message.reply_text("📭 No flow signals. Run /flow first.")
+        return
+
+    await update.message.reply_text("⏳ Analyzing signals with Claude... (30-60 sec)")
+
+    try:
+        from flow_analyzer import analyze_flow_signals, format_flow_analysis_for_telegram
+
+        signals = last_flow_results["signals"][:5]  # Top 5
+        enriched = analyze_flow_signals(signals, max_analyze=5)
+
+        last_flow_results["analyzed"] = enriched
+
+        for e in enriched:
+            msg = format_flow_analysis_for_telegram(e)
+            await update.message.reply_text(msg, parse_mode="Markdown")
+
+        buys = [e for e in enriched if e.recommendation == "BUY"]
+        if buys:
+            symbols = ", ".join(e.signal.symbol for e in buys)
+            await update.message.reply_text(
+                f"🟢 *BUY Recommendations:* {symbols}\n\nUse `/buyoption SYMBOL confirm` to execute",
+                parse_mode="Markdown"
+            )
+
+    except Exception as e:
+        logger.error(f"Analysis error: {e}")
+        await update.message.reply_text(f"❌ Analysis failed: {str(e)}")
+
+
+@admin_only
+async def cmd_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show options positions and performance"""
+    try:
+        from options_executor import get_options_positions, get_options_summary
+        from db import get_options_performance
+
+        summary = get_options_summary()
+        perf = get_options_performance()
+
+        msg = "📊 *Options Positions*\n\n"
+
+        if summary["count"] == 0:
+            msg += "No open options positions.\n\n"
+        else:
+            msg += f"*Open Positions ({summary['count']}):*\n"
+            for pos in summary["positions"]:
+                emoji = "🟢" if pos["unrealized_pl"] >= 0 else "🔴"
+                msg += f"\n{emoji} *{pos['symbol']}* {pos['option_type'].upper()} ${pos['strike']}\n"
+                msg += f"   {pos['quantity']}x @ ${pos['avg_entry_price']:.2f}\n"
+                msg += f"   P/L: ${pos['unrealized_pl']:.2f} ({pos['unrealized_plpc']*100:.1f}%)\n"
+
+            msg += f"\n*Portfolio:*\n"
+            msg += f"├── Total Value: ${summary['total_value']:,.2f}\n"
+            msg += f"├── Total P/L: ${summary['total_pnl']:,.2f} ({summary['pnl_pct']:.1f}%)\n"
+            msg += f"└── % of Portfolio: {summary['portfolio_pct']:.1f}%\n"
+
+        msg += f"\n*All-Time Performance:*\n"
+        msg += f"├── Trades: {perf['total_trades']} ({perf['open_trades']} open)\n"
+        msg += f"├── Win Rate: {perf['win_rate']:.0f}%\n"
+        msg += f"├── Avg Win: +{perf['avg_win']:.1f}% | Avg Loss: {perf['avg_loss']:.1f}%\n"
+        msg += f"└── Total P/L: ${perf['total_pnl']:,.2f}\n"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Options status error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+@admin_only
+async def cmd_buyoption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Execute options trade from analyzed signals"""
+    global last_flow_results
+
+    if not context.args:
+        await update.message.reply_text("Usage: `/buyoption SYMBOL [confirm]`", parse_mode="Markdown")
+        return
+
+    symbol = context.args[0].upper()
+
+    # Find in analyzed signals
+    analyzed = last_flow_results.get("analyzed", [])
+    enriched = next((e for e in analyzed if e.signal.symbol == symbol), None)
+
+    if not enriched:
+        await update.message.reply_text(
+            f"⚠️ {symbol} not in analyzed signals.\nRun /flow then /analyze first."
+        )
+        return
+
+    if enriched.recommendation != "BUY":
+        await update.message.reply_text(
+            f"⚠️ {symbol} recommendation is {enriched.recommendation}, not BUY.\n"
+            f"Conviction: {enriched.conviction:.0%}"
+        )
+        return
+
+    # Confirmation
+    if len(context.args) < 2 or context.args[1].lower() != "confirm":
+        signal = enriched.signal
+        msg = f"⚠️ *Confirm Options Trade*\n\n"
+        msg += f"Symbol: *{symbol}*\n"
+        msg += f"Contract: {signal.option_type.upper()} ${signal.strike} exp {signal.expiration[:10]}\n"
+        msg += f"Signal Score: {signal.score}/20\n"
+        msg += f"Conviction: {enriched.conviction:.0%}\n\n"
+        msg += f"Send `/buyoption {symbol} confirm` to execute"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    # Execute
+    await update.message.reply_text(f"⏳ Executing options trade for {symbol}...")
+
+    try:
+        from options_executor import execute_flow_trade
+        result = execute_flow_trade(enriched)
+
+        if result.get("success"):
+            msg = f"✅ *Options Trade Executed*\n\n"
+            msg += f"Contract: {result['contract_symbol']}\n"
+            msg += f"Quantity: {result['quantity']}\n"
+            msg += f"Est. Cost: ${result.get('estimated_cost', 0):,.2f}\n"
+            msg += f"Strike: ${result['strike']} | Exp: {result['expiration']}\n\n"
+            if result.get('thesis'):
+                msg += f"*Thesis:* {result['thesis'][:200]}..."
+        else:
+            msg = f"❌ Trade failed: {result.get('error')}"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Options trade error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+@admin_only
+async def cmd_closeoption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Close an options position"""
+    if not context.args:
+        await update.message.reply_text("Usage: `/closeoption CONTRACT_SYMBOL`", parse_mode="Markdown")
+        return
+
+    contract = context.args[0].upper()
+    reason = " ".join(context.args[1:]) if len(context.args) > 1 else "manual"
+
+    await update.message.reply_text(f"⏳ Closing options position {contract}...")
+
+    try:
+        from options_executor import close_options_position
+        result = close_options_position(contract, reason)
+
+        if result.get("success"):
+            msg = f"✅ Closed {result.get('quantity', 1)}x {contract}\n"
+            if "pnl" in result:
+                emoji = "🟢" if result["pnl"] >= 0 else "🔴"
+                msg += f"{emoji} P/L: ${result['pnl']:.2f} ({result['pnl_pct']*100:.1f}%)"
+        else:
+            msg = f"❌ Failed: {result.get('error')}"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Close option error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
 @admin_only
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle natural language messages"""
@@ -954,7 +1191,14 @@ def main():
     app.add_handler(CommandHandler("weekly", cmd_weekly))
     app.add_handler(CommandHandler("monthly", cmd_monthly))
     app.add_handler(CommandHandler("export", cmd_export))
-    
+
+    # Options flow handlers
+    app.add_handler(CommandHandler("flow", cmd_flow))
+    app.add_handler(CommandHandler("analyze", cmd_analyze))
+    app.add_handler(CommandHandler("options", cmd_options))
+    app.add_handler(CommandHandler("buyoption", cmd_buyoption))
+    app.add_handler(CommandHandler("closeoption", cmd_closeoption))
+
     # Natural language handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     

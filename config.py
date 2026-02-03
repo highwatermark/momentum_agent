@@ -19,6 +19,9 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets
 # Anthropic API (Claude)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
+# Unusual Whales API
+UW_API_KEY = os.getenv("UW_API_KEY")
+
 # Trading Parameters
 TRADING_CONFIG = {
     # Universe filters
@@ -146,4 +149,45 @@ def get_monitor_setting(key: str):
     """Get a specific monitor setting"""
     config = get_runtime_config()
     return config.get(key, MONITOR_CONFIG.get(key))
+
+
+# Options Trading Parameters
+OPTIONS_CONFIG = {
+    "max_options_positions": 4,
+    "max_position_value": 2000,
+    "position_size_pct": 0.02,        # 2% of portfolio per options trade
+    "max_portfolio_risk_options": 0.10,  # Max 10% in options
+    "default_contracts": 1,
+    "max_contracts_per_trade": 10,
+    "min_premium": 50,                # Min $0.50 per contract
+    "max_premium": 1000,              # Max $10.00 per contract
+    "min_days_to_exp": 7,
+    "max_days_to_exp": 60,
+    "profit_target_pct": 0.50,        # 50% profit target
+    "stop_loss_pct": 0.50,            # 50% stop loss
+}
+
+# Flow Scanning Parameters
+FLOW_CONFIG = {
+    "min_premium": 100000,            # $100K minimum flow premium
+    "min_vol_oi": 1.0,                # Vol/OI > 1
+    "min_score": 8,                   # Minimum conviction score
+    "max_analyze": 10,                # Max signals to analyze with Claude
+    "scan_limit": 50,                 # Raw alerts to fetch
+}
+
+# Flow Signal Scoring Weights
+FLOW_SCORING = {
+    "sweep": 3,                       # Intermarket sweep (urgency)
+    "ask_side": 2,                    # Bought at ask (bullish conviction)
+    "high_premium": 3,                # $100K+ premium
+    "very_high_premium": 2,           # $250K+ premium (bonus)
+    "high_vol_oi": 2,                 # Vol/OI > 1
+    "very_high_vol_oi": 1,            # Vol/OI > 3 (bonus)
+    "floor_trade": 2,                 # Floor trade (institutional)
+    "otm": 1,                         # Out of the money
+    "near_earnings": 1,               # Within 14 days of earnings
+    "low_dte": 1,                     # < 30 DTE
+    "opening_trade": 2,               # Opening position
+}
 
