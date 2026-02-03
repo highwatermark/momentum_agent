@@ -229,6 +229,16 @@ The monitor calculates a **reversal score** (0-13) for position alerts:
 - Allows positions to survive temporary whipsaws/pullbacks
 - Reasoning: Same-day exits had 6.2% win rate vs 62.5% for 3+ day holds
 
+**Winner Protection** (added 2026-02-03):
+- Positions with P/L >= 5% are **protected from auto-close**
+- Lets winners run through temporary pullbacks
+- User can still manually close via `/close SYMBOL`
+
+**RSI Enforcement** (added 2026-02-03):
+- Trades blocked at execution if RSI >= 70
+- Prevents entering overbought stocks even from watchlist
+- Applied in `executor.py` as final safety check
+
 The auto-close feature can be configured via Telegram bot commands (`/set autoclose on|off`, `/set threshold N`).
 
 ## Self-Learning Loop

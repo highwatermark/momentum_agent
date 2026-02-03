@@ -434,6 +434,12 @@ def execute_trade(symbol: str, signals: dict, decision: dict, cap: str = None) -
     """
     print(f"[{datetime.now()}] Executing trade for {symbol}...")
 
+    # RSI enforcement - block overbought entries
+    rsi = signals.get('rsi_14', 50)
+    if rsi >= 70:
+        print(f"✗ RSI too high ({rsi:.0f} >= 70) - blocking entry")
+        return {"success": False, "error": f"RSI too high ({rsi:.0f} >= 70)"}
+
     result = place_entry_order(symbol, signals, cap=cap)
     
     if result["success"]:

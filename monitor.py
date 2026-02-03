@@ -356,6 +356,14 @@ def run_monitor():
                 results.append(result)
                 continue
 
+            # Skip auto-close if position is a big winner (let winners run)
+            if pnl_pct >= 5.0:
+                print(f"  💰 WINNER PROTECTION: Skipping auto-close (P/L: +{pnl_pct:.1f}%)")
+                send_telegram_alert(symbol, result["score"], result["signals"], pnl_pct, auto_closed=False)
+                result["auto_closed"] = False
+                results.append(result)
+                continue
+
             # Strong reversal with sufficient hold time - auto-close position
             print(f"  🚨 STRONG REVERSAL (score >= {auto_close_threshold}, held {days_held} days) - AUTO-CLOSING!")
             close_result = close_position(
