@@ -613,3 +613,33 @@ AAPL260220C00100000:
 - Accessible via `/flowperf` command
 
 **Status**: Tested and deployed, bot running (PID 60241).
+
+### 2026-02-03 - Fully Automated Options Flow Trading
+
+**Change**: Added fully automated options flow job with Telegram notifications at each step
+
+**New File**: `flow_job.py`
+- `run_full_flow_job()`: Complete scan -> Claude analysis -> execute BUY cycle
+- `run_exit_check_job()`: Check positions for profit target (50%) / stop loss (50%)
+- `run_dte_alert_job()`: Send DTE alerts for expiring positions
+- Telegram notifications at every step
+
+**Cron Schedule (Weekdays)**:
+| Job | Time (ET) | UTC | Description |
+|-----|-----------|-----|-------------|
+| `flow_job.py full` | 10:00 AM | 15:00 | Full scan + analysis + execution |
+| `flow_job.py full` | 2:00 PM | 19:00 | Full scan + analysis + execution |
+| `flow_job.py exits` | Every 30 min | 14:30-20:30 | Exit checks |
+| `flow_job.py dte` | 9:30 AM | 14:30 | DTE alerts |
+
+**Telegram Notification Flow**:
+1. "Options Flow Job Started" - timestamp
+2. "Flow Scan Complete" - signal count, premium, top 5 signals
+3. "Analyzing signals with Claude..." - progress
+4. "Claude Analysis Complete" - recommendations with conviction
+5. "Executing N trades..." - progress
+6. "Execution Complete" - contracts, Greeks, cost per trade
+7. "Auto-Exit Triggered" (if any) - P/L, reason
+8. "Flow Job Complete" - portfolio summary
+
+**Status**: Cron installed, ready for 2026-02-04 market session.

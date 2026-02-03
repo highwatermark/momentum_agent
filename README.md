@@ -54,6 +54,7 @@ An automated momentum trading system that scans for high-momentum stocks, uses C
 | `flow_scanner.py` | Unusual Whales API client for options flow signals |
 | `flow_analyzer.py` | Signal enrichment and Claude thesis generation |
 | `options_executor.py` | Alpaca options trading and position management |
+| `flow_job.py` | Automated options flow job (scan, analyze, execute, exit checks) |
 
 ## Services
 
@@ -669,6 +670,27 @@ This enables data-driven refinement of signal weights.
    - `/options` for P/L tracking
 8. **Exit**: `/closeoption CONTRACT` with exit Greeks logged
 9. **Learn**: Signal outcome recorded to `flow_signal_outcomes`
+
+### Options Automation Schedule
+
+The options flow system runs fully automated via cron:
+
+| Job | Schedule (ET) | UTC | Description |
+|-----|---------------|-----|-------------|
+| `flow_job.py full` | 10:00 AM | 15:00 | Full scan + Claude analysis + execute BUY |
+| `flow_job.py full` | 2:00 PM | 19:00 | Full scan + Claude analysis + execute BUY |
+| `flow_job.py exits` | Every 30 min | 14:30-20:30 | Check profit target (50%) / stop loss (50%) |
+| `flow_job.py dte` | 9:30 AM | 14:30 | DTE alerts for expiring positions |
+
+**Telegram Notifications at Each Step:**
+1. Job start notification
+2. Flow scan results (signals found, top 5)
+3. Claude analysis (recommendations, conviction)
+4. Execution results (contracts, Greeks, cost)
+5. Auto-exit notifications (P/L, reason)
+6. Portfolio summary
+
+**Manual Override:** You can still use `/flow`, `/analyze`, `/buyoption` for manual control.
 
 ### Options Configuration
 
