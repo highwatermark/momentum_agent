@@ -51,6 +51,9 @@ An automated momentum trading system that scans for high-momentum stocks, uses C
 | `jobs.py` | Background jobs for DQL data collection & maintenance |
 | `config.py` | Configuration parameters |
 | `main.py` | CLI entry point for manual operations |
+| `flow_scanner.py` | Unusual Whales API client for options flow signals |
+| `flow_analyzer.py` | Signal enrichment and Claude thesis generation |
+| `options_executor.py` | Alpaca options trading and position management |
 
 ## Services
 
@@ -99,6 +102,17 @@ sudo systemctl restart position-monitor.timer
 | `/monthly` | Last 30 days with weekly breakdown |
 | `/export` | Export trades & candidates to CSV |
 | `/error` | Show recent errors from logs |
+
+### Options Flow Commands
+
+| Command | Description |
+|---------|-------------|
+| `/flow` | Scan options flow from Unusual Whales |
+| `/analyze` | Analyze top signals with Claude thesis |
+| `/options` | View options positions & performance |
+| `/buyoption SYMBOL` | Execute options trade (requires confirm) |
+| `/closeoption CONTRACT` | Close options position |
+| `/reconcile` | Sync options DB with Alpaca positions |
 
 ## Configuration
 
@@ -490,6 +504,78 @@ When `skip_buys_when_healthy` is enabled and all positions have reversal score <
 2. Results logged to database for tracking
 3. **No new buys executed** - lets winners run
 4. Telegram summary indicates "SKIP MODE"
+
+## Options Flow Trading (Added 2026-02-03)
+
+Options flow trading system integrated with Unusual Whales API.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      TELEGRAM BOT                               │
+│  Commands: /flow /analyze /options /buyoption /closeoption      │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │
+          ┌───────────────┼───────────────┐
+          ▼               ▼               ▼
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│  FLOW_SCANNER   │ │  FLOW_ANALYZER  │ │OPTIONS_EXECUTOR │
+│  flow_scanner.py│ │ flow_analyzer.py│ │options_executor │
+│                 │ │                 │ │                 │
+│ - UW API client │ │ - Alpaca data   │ │ - Find contracts│
+│ - Flow alerts   │ │ - Claude thesis │ │ - Position size │
+│ - Signal scoring│ │ - Recommendations│ │ - Place orders  │
+└─────────────────┘ └─────────────────┘ └─────────────────┘
+```
+
+### Flow Signal Scoring (0-20)
+
+| Signal | Points | Criteria |
+|--------|--------|----------|
+| Sweep | +3 | Intermarket sweep (urgency) |
+| Ask Side | +2 | Bought at ask (conviction) |
+| Premium $100K+ | +3 | Serious money |
+| Premium $250K+ | +2 | Very high premium (bonus) |
+| Vol/OI > 1 | +2 | Unusual activity |
+| Vol/OI > 3 | +1 | Very high ratio (bonus) |
+| Floor Trade | +2 | Institutional origin |
+| Opening Trade | +2 | New position |
+| OTM | +1 | Out of the money |
+| Near Earnings | +1 | Within 14 days |
+| Low DTE | +1 | Under 30 days to expiration |
+
+Minimum score for consideration: **8/20**
+
+### Options Safety Features
+
+| Safety Check | Threshold | Action |
+|--------------|-----------|--------|
+| Bid-Ask Spread | > 15% | Block trade |
+| Minimum Bid | < $0.05 | Block trade |
+| Bid Size | < 10 | Block trade |
+| Order Type | - | Limit orders at mid + 2% |
+
+### Options Workflow
+
+1. **Scan**: `/flow` fetches signals from Unusual Whales
+2. **Filter**: Signals scored and filtered (min 8 points)
+3. **Analyze**: `/analyze` enriches with Alpaca data + Claude thesis
+4. **Execute**: `/buyoption SYMBOL confirm` places limit order
+5. **Monitor**: Check profit target (50%) and stop loss (50%)
+6. **Exit**: `/closeoption CONTRACT` or auto-exit on targets
+
+### Options Configuration
+
+```python
+OPTIONS_CONFIG = {
+    "max_options_positions": 4,
+    "max_position_value": 2000,
+    "position_size_pct": 0.02,        # 2% of portfolio
+    "profit_target_pct": 0.50,        # 50% profit target
+    "stop_loss_pct": 0.50,            # 50% stop loss
+}
+```
 
 ## Background Jobs (DQL Training)
 
