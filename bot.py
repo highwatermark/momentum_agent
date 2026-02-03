@@ -128,7 +128,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/analyze - Analyze with Claude\n"
         "/options - Options positions\n"
         "/buyoption SYMBOL - Buy option\n"
-        "/closeoption CONTRACT - Close option\n\n"
+        "/closeoption CONTRACT - Close option\n"
+        "/reconcile - Sync DB with Alpaca\n\n"
         "*Analytics:*\n"
         "/metrics - Baseline performance\n"
         "/weekly - Last 7 days report\n"
@@ -1125,6 +1126,38 @@ async def cmd_closeoption(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def cmd_reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reconcile options positions between DB and Alpaca"""
+    await update.message.reply_text("⏳ Reconciling options positions...")
+
+    try:
+        from options_executor import reconcile_options_positions
+
+        result = reconcile_options_positions()
+
+        if result["synced"]:
+            await update.message.reply_text(
+                f"✅ Options positions synced\n"
+                f"Alpaca: {result['actual_count']} | DB: {result['db_count']}"
+            )
+        else:
+            msg = "⚠️ *Position Mismatches Found*\n\n"
+
+            for mtype, items in result["mismatches"].items():
+                if items:
+                    msg += f"*{mtype}:*\n"
+                    for item in items:
+                        msg += f"  • {item['contract']}: {item.get('action', '')}\n"
+                    msg += "\n"
+
+            await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Reconcile error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+@admin_only
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle natural language messages"""
     text = update.message.text.lower()
@@ -1198,6 +1231,7 @@ def main():
     app.add_handler(CommandHandler("options", cmd_options))
     app.add_handler(CommandHandler("buyoption", cmd_buyoption))
     app.add_handler(CommandHandler("closeoption", cmd_closeoption))
+    app.add_handler(CommandHandler("reconcile", cmd_reconcile))
 
     # Natural language handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

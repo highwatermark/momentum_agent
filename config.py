@@ -191,3 +191,26 @@ FLOW_SCORING = {
     "opening_trade": 2,               # Opening position
 }
 
+# Options Safety Limits
+OPTIONS_SAFETY = {
+    # Liquidity
+    "max_spread_pct": 15.0,           # Max 15% bid-ask spread
+    "min_open_interest": 100,         # Minimum OI for liquidity
+    "min_volume": 10,                 # Minimum daily volume
+    "min_bid": 0.05,                  # Minimum bid price (avoid pennies)
+    "min_bid_size": 10,               # Minimum bid size
+
+    # Concentration
+    "max_single_sector_pct": 50.0,    # Max 50% in one sector
+    "max_single_underlying_pct": 30.0,  # Max 30% in one underlying
+
+    # Time
+    "earnings_blackout_days": 2,      # Block trades 2 days before earnings
+    "roll_alert_dte": 7,              # Alert when DTE <= 7
+    "critical_dte": 3,                # Critical when DTE <= 3
+
+    # Execution
+    "use_limit_orders": True,         # Use limit orders by default
+    "limit_price_buffer_pct": 2.0,    # % above mid for buys
+}
+

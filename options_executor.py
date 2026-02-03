@@ -23,7 +23,7 @@ from alpaca.trading.enums import (
     ContractType
 )
 
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, OPTIONS_CONFIG
+from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, OPTIONS_CONFIG, OPTIONS_SAFETY
 from db import (
     log_options_trade,
     update_options_trade_exit,
@@ -64,6 +64,213 @@ def get_account_info() -> Dict:
         "cash": float(account.cash),
         "buying_power": float(account.buying_power),
         "options_buying_power": float(getattr(account, 'options_buying_power', account.buying_power)),
+    }
+
+
+def get_option_quote(contract_symbol: str) -> Dict:
+    """
+    Get current bid/ask for an option contract.
+
+    Returns:
+        Dict with bid, ask, mid, spread, spread_pct
+    """
+    try:
+        from alpaca.data.historical.option import OptionHistoricalDataClient
+        from alpaca.data.requests import OptionLatestQuoteRequest
+
+        client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+        request = OptionLatestQuoteRequest(symbol_or_symbols=[contract_symbol])
+        quotes = client.get_option_latest_quote(request)
+
+        if contract_symbol in quotes:
+            quote = quotes[contract_symbol]
+            bid = float(quote.bid_price) if quote.bid_price else 0
+            ask = float(quote.ask_price) if quote.ask_price else 0
+            mid = (bid + ask) / 2 if bid and ask else 0
+            spread = ask - bid if bid and ask else 0
+            spread_pct = (spread / mid * 100) if mid > 0 else 100
+
+            return {
+                "bid": bid,
+                "ask": ask,
+                "mid": mid,
+                "spread": spread,
+                "spread_pct": spread_pct,
+                "bid_size": getattr(quote, 'bid_size', 0),
+                "ask_size": getattr(quote, 'ask_size', 0),
+            }
+    except Exception as e:
+        print(f"Error getting option quote for {contract_symbol}: {e}")
+
+    return {"bid": 0, "ask": 0, "mid": 0, "spread": 0, "spread_pct": 100}
+
+
+def check_option_liquidity(contract_symbol: str) -> Dict:
+    """
+    Check if option contract is liquid enough to trade.
+
+    Returns:
+        Dict with 'liquid' bool and 'reasons' list if not liquid
+    """
+    quote = get_option_quote(contract_symbol)
+    reasons = []
+
+    # Check spread
+    if quote["spread_pct"] > OPTIONS_SAFETY["max_spread_pct"]:
+        reasons.append(f"Spread {quote['spread_pct']:.1f}% > {OPTIONS_SAFETY['max_spread_pct']}%")
+
+    # Check bid exists
+    if quote["bid"] < OPTIONS_SAFETY["min_bid"]:
+        reasons.append(f"Bid ${quote['bid']:.2f} too low (min ${OPTIONS_SAFETY['min_bid']})")
+
+    # Check size
+    min_size = OPTIONS_SAFETY.get("min_bid_size", 10)
+    if quote.get("bid_size", 0) < min_size:
+        reasons.append(f"Bid size {quote.get('bid_size', 0)} < {min_size}")
+
+    return {
+        "liquid": len(reasons) == 0,
+        "reasons": reasons,
+        "quote": quote,
+    }
+
+
+def place_options_order_smart(
+    contract_symbol: str,
+    quantity: int,
+    side: str = "buy",
+    max_spread_pct: float = None,
+    signal_data: Dict = None,
+) -> Dict:
+    """
+    Place options order with smart limit pricing.
+
+    - Gets current quote
+    - Checks spread width
+    - Places limit order at favorable price
+
+    Args:
+        contract_symbol: Full OCC contract symbol
+        quantity: Number of contracts
+        side: 'buy' or 'sell'
+        max_spread_pct: Maximum allowed spread (default from OPTIONS_SAFETY)
+        signal_data: Optional signal data for logging
+
+    Returns:
+        Order result dict
+    """
+    max_spread_pct = max_spread_pct or OPTIONS_SAFETY["max_spread_pct"]
+
+    # Get current quote
+    quote = get_option_quote(contract_symbol)
+
+    # Check spread
+    if quote["spread_pct"] > max_spread_pct:
+        return {
+            "success": False,
+            "error": f"Spread too wide: {quote['spread_pct']:.1f}% (max {max_spread_pct}%)",
+            "quote": quote,
+        }
+
+    # Check minimum bid
+    if quote["bid"] < OPTIONS_SAFETY["min_bid"]:
+        return {
+            "success": False,
+            "error": f"Bid too low: ${quote['bid']:.2f} (min ${OPTIONS_SAFETY['min_bid']})",
+            "quote": quote,
+        }
+
+    # Calculate limit price
+    buffer_pct = OPTIONS_SAFETY.get("limit_price_buffer_pct", 2.0) / 100
+
+    if side.lower() == "buy":
+        # Buy at mid or slightly above (willing to pay up a bit)
+        limit_price = round(quote["mid"] * (1 + buffer_pct), 2)
+        limit_price = min(limit_price, quote["ask"])  # But not above ask
+    else:
+        # Sell at mid or slightly below
+        limit_price = round(quote["mid"] * (1 - buffer_pct), 2)
+        limit_price = max(limit_price, quote["bid"])  # But not below bid
+
+    print(f"  Quote: bid=${quote['bid']:.2f} ask=${quote['ask']:.2f} (spread {quote['spread_pct']:.1f}%)")
+    print(f"  Limit order at ${limit_price:.2f}")
+
+    # Place limit order
+    return place_options_order(
+        contract_symbol=contract_symbol,
+        quantity=quantity,
+        side=side,
+        order_type="limit",
+        limit_price=limit_price,
+        signal_data=signal_data,
+    )
+
+
+def reconcile_options_positions() -> Dict:
+    """
+    Compare database positions with actual Alpaca positions.
+
+    Returns:
+        Dict with mismatches and actions needed
+    """
+    from db import get_open_options_trades
+
+    # Get actual positions from Alpaca
+    actual_positions = get_options_positions()
+    actual_contracts = {p.contract_symbol: p for p in actual_positions}
+
+    # Get DB positions
+    db_trades = get_open_options_trades()
+    db_contracts = {t["contract_symbol"]: t for t in db_trades}
+
+    mismatches = {
+        "in_db_not_alpaca": [],      # DB says open, but not in Alpaca
+        "in_alpaca_not_db": [],      # In Alpaca, but not in DB
+        "quantity_mismatch": [],      # Different quantities
+    }
+
+    # Check DB positions against Alpaca
+    for contract, db_trade in db_contracts.items():
+        if contract not in actual_contracts:
+            mismatches["in_db_not_alpaca"].append({
+                "contract": contract,
+                "db_qty": db_trade["quantity"],
+                "action": "Mark as closed in DB (likely filled exit order)",
+            })
+            # Auto-fix: mark as closed
+            try:
+                update_options_trade_exit(
+                    trade_id=db_trade["id"],
+                    exit_price=0,  # Unknown
+                    exit_reason="reconciliation_closed"
+                )
+                print(f"  Auto-closed DB record for {contract}")
+            except Exception as e:
+                print(f"  Could not auto-close {contract}: {e}")
+        else:
+            actual = actual_contracts[contract]
+            if actual.quantity != db_trade["quantity"]:
+                mismatches["quantity_mismatch"].append({
+                    "contract": contract,
+                    "db_qty": db_trade["quantity"],
+                    "actual_qty": actual.quantity,
+                })
+
+    # Check Alpaca positions against DB
+    for contract, actual in actual_contracts.items():
+        if contract not in db_contracts:
+            mismatches["in_alpaca_not_db"].append({
+                "contract": contract,
+                "actual_qty": actual.quantity,
+                "action": "Add to DB (manual trade or missed log)",
+            })
+
+    return {
+        "synced": all(len(v) == 0 for v in mismatches.values()),
+        "mismatches": mismatches,
+        "actual_count": len(actual_positions),
+        "db_count": len(db_trades),
     }
 
 
@@ -458,13 +665,29 @@ def execute_flow_trade(enriched_signal) -> Dict:
     print(f"  Quantity: {quantity} contracts")
     print(f"  Est. Cost: ${quantity * estimated_price * 100:,.2f}")
 
-    # Place the order
-    order_result = place_options_order(
-        contract_symbol=contract['symbol'],
-        quantity=quantity,
-        side="buy",
-        order_type="market"
-    )
+    # Check liquidity before trading
+    liquidity = check_option_liquidity(contract['symbol'])
+    if not liquidity["liquid"]:
+        return {
+            "success": False,
+            "error": f"Liquidity check failed: {', '.join(liquidity['reasons'])}",
+            "quote": liquidity.get("quote"),
+        }
+
+    # Place the order using smart limit orders
+    if OPTIONS_SAFETY.get("use_limit_orders", True):
+        order_result = place_options_order_smart(
+            contract_symbol=contract['symbol'],
+            quantity=quantity,
+            side="buy",
+        )
+    else:
+        order_result = place_options_order(
+            contract_symbol=contract['symbol'],
+            quantity=quantity,
+            side="buy",
+            order_type="market"
+        )
 
     if not order_result.get("success"):
         return order_result
