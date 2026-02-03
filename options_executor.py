@@ -949,19 +949,85 @@ def find_option_contract(
 def calculate_options_position_size(
     account_equity: float,
     option_price: float,
-    conviction: float = 0.5
+    conviction: float = 0.5,
+    underlying: str = None,
+    option_type: str = "call",
+    strike: float = 0,
+    expiration: str = None,
+    signal_score: int = 0,
+    use_agent: bool = True
 ) -> int:
     """
-    Calculate number of contracts based on config limits.
+    Calculate number of contracts based on config limits with optional AI agent.
 
     Args:
         account_equity: Total account equity
         option_price: Price per contract (premium * 100)
         conviction: Signal conviction (0-1), used to scale size
+        underlying: Stock symbol (for agent)
+        option_type: 'call' or 'put' (for agent)
+        strike: Strike price (for agent)
+        expiration: Expiration date (for agent)
+        signal_score: Signal score 0-20 (for agent)
+        use_agent: Whether to use AI agent (falls back to rules if fails)
 
     Returns:
         Number of contracts to buy
     """
+    # Try AI agent for intelligent sizing
+    if use_agent and underlying:
+        try:
+            from options_agent import calculate_position_size, PositionSizingInput
+
+            # Get portfolio state
+            positions = get_options_positions()
+            portfolio_greeks = get_portfolio_greeks()
+            concentration = check_sector_concentration()
+
+            # Get underlying ATR and IV rank (estimate if not available)
+            underlying_atr = strike * 0.02 if strike else 5.0  # 2% ATR estimate
+            underlying_iv_rank = 30  # Default
+
+            sizing_input = PositionSizingInput(
+                underlying=underlying,
+                option_type=option_type,
+                strike=strike,
+                expiration=expiration or "",
+                option_price=option_price,
+                underlying_price=strike,  # Approximate
+                underlying_atr=underlying_atr,
+                underlying_iv_rank=underlying_iv_rank,
+                account_equity=account_equity,
+                cash_available=account_equity * 0.4,  # Estimate
+                current_options_exposure=sum(p.market_value for p in positions),
+                current_positions_count=len(positions),
+                portfolio_delta=portfolio_greeks.get('net_delta', 0),
+                portfolio_gamma=portfolio_greeks.get('total_gamma', 0),
+                portfolio_theta=portfolio_greeks.get('daily_theta', 0),
+                portfolio_vega=portfolio_greeks.get('total_vega', 0),
+                sector=get_sector(underlying),
+                sector_exposure_pct=concentration['sectors'].get(get_sector(underlying), 0),
+                signal_score=signal_score,
+                signal_conviction=conviction
+            )
+
+            result = calculate_position_size(sizing_input, use_agent=True)
+
+            if result.agent_used:
+                print(f"  [Agent] Position size: {result.recommended_contracts} contracts")
+                print(f"  [Agent] Reasoning: {result.reasoning[:100]}...")
+                return result.recommended_contracts
+            else:
+                print(f"  [Agent Fallback] {result.fallback_reason}")
+                return result.recommended_contracts
+
+        except Exception as e:
+            print(f"  [Agent Error] Position sizing agent failed: {e}")
+            # Fall through to rules-based sizing
+
+    # Rules-based fallback
+    print("  [Rules] Using config-based position sizing")
+
     # Base position value from config
     max_position_value = OPTIONS_CONFIG["max_position_value"]
     pct_position_value = account_equity * OPTIONS_CONFIG["position_size_pct"]
@@ -1164,11 +1230,17 @@ def execute_flow_trade(enriched_signal) -> Dict:
     # Estimate option price (use signal premium / size as rough estimate)
     estimated_price = (signal.premium / signal.size / 100) if signal.size > 0 else 1.0
 
-    # Calculate position size
+    # Calculate position size using AI agent
     quantity = calculate_options_position_size(
         account_equity=account["equity"],
         option_price=estimated_price,
-        conviction=enriched_signal.conviction
+        conviction=enriched_signal.conviction,
+        underlying=signal.symbol,
+        option_type=signal.option_type,
+        strike=contract['strike'],
+        expiration=contract['expiration'],
+        signal_score=signal.score,
+        use_agent=True
     )
 
     print(f"  Contract: {contract['symbol']}")
@@ -1546,6 +1618,343 @@ def get_options_summary() -> Dict:
         "pnl_pct": (total_pnl / total_value * 100) if total_value > 0 else 0,
         "portfolio_pct": (total_value / account["equity"] * 100) if account["equity"] > 0 else 0
     }
+
+
+# ============== AI-POWERED POSITION REVIEW ==============
+
+def review_options_positions(use_agent: bool = True) -> List[Dict]:
+    """
+    Review all options positions using AI agent.
+
+    Args:
+        use_agent: Whether to use Claude agent (falls back to rules if fails)
+
+    Returns:
+        List of review results with recommendations
+    """
+    from options_agent import review_all_positions, PositionReviewInput
+
+    print(f"[{datetime.now()}] Reviewing options positions...")
+
+    positions = get_options_positions()
+    if not positions:
+        print("  No options positions to review")
+        return []
+
+    # Get market context
+    market_context = {}
+    try:
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+
+        client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+        # Get SPY data
+        end = datetime.now()
+        start = end - timedelta(days=5)
+        request = StockBarsRequest(
+            symbol_or_symbols=["SPY", "VIX"],
+            timeframe=TimeFrame.Day,
+            start=start,
+            end=end
+        )
+        bars = client.get_stock_bars(request)
+
+        if "SPY" in bars.data and len(bars.data["SPY"]) >= 2:
+            spy_bars = sorted(bars.data["SPY"], key=lambda x: x.timestamp)
+            market_context["spy_change_1d"] = (spy_bars[-1].close - spy_bars[-2].close) / spy_bars[-2].close
+
+        # VIX level
+        if "VIX" in bars.data and bars.data["VIX"]:
+            vix_bars = sorted(bars.data["VIX"], key=lambda x: x.timestamp)
+            market_context["vix_level"] = vix_bars[-1].close
+    except Exception as e:
+        print(f"  Warning: Could not get market context: {e}")
+        market_context = {"spy_change_1d": 0, "vix_level": 15}
+
+    # Build position dicts with Greeks
+    position_dicts = []
+    for pos in positions:
+        try:
+            # Calculate DTE
+            dte = 30  # Default
+            if pos.expiration:
+                exp_date = datetime.strptime(pos.expiration, "%Y-%m-%d")
+                dte = max(0, (exp_date - datetime.now()).days)
+
+            # Get Greeks
+            greeks = get_option_greeks(pos.contract_symbol)
+
+            position_dicts.append({
+                'contract_symbol': pos.contract_symbol,
+                'symbol': pos.symbol,
+                'option_type': pos.option_type,
+                'strike': pos.strike,
+                'expiration': pos.expiration,
+                'quantity': pos.quantity,
+                'avg_entry_price': pos.avg_entry_price,
+                'current_price': pos.current_price,
+                'unrealized_pl': pos.unrealized_pl,
+                'unrealized_plpc': pos.unrealized_plpc,
+                'delta': greeks.delta,
+                'gamma': greeks.gamma,
+                'theta': greeks.theta,
+                'vega': greeks.vega,
+                'iv': greeks.iv,
+                'underlying_price': pos.strike,  # Approximate
+                'days_to_expiry': dte,
+                'sector': get_sector(pos.symbol)
+            })
+        except Exception as e:
+            print(f"  Warning: Error processing {pos.contract_symbol}: {e}")
+
+    # Call the review agent
+    results = review_all_positions(position_dicts, market_context, use_agent=use_agent)
+
+    # Log results
+    for result in results:
+        emoji = "🔴" if result.urgency == "critical" else "🟠" if result.urgency == "high" else "🟡" if result.urgency == "medium" else "🟢"
+        print(f"  {emoji} {result.contract_symbol}: {result.recommendation} ({result.urgency})")
+        if result.reasoning:
+            print(f"      Reason: {result.reasoning[:80]}...")
+
+    return [
+        {
+            'contract_symbol': r.contract_symbol,
+            'recommendation': r.recommendation,
+            'urgency': r.urgency,
+            'reasoning': r.reasoning,
+            'risk_factors': r.risk_factors,
+            'roll_to_expiration': r.roll_to_expiration,
+            'confidence': r.confidence,
+            'agent_used': r.agent_used
+        }
+        for r in results
+    ]
+
+
+def review_options_portfolio(use_agent: bool = True) -> Dict:
+    """
+    Review the overall options portfolio using AI agent.
+
+    Args:
+        use_agent: Whether to use Claude agent (falls back to rules if fails)
+
+    Returns:
+        Portfolio review result with assessment and recommendations
+    """
+    from options_agent import review_portfolio, PortfolioReviewInput
+
+    print(f"[{datetime.now()}] Reviewing options portfolio...")
+
+    positions = get_options_positions()
+    account = get_account_info()
+    portfolio_greeks = get_portfolio_greeks()
+    concentration = check_sector_concentration()
+
+    # Count positions expiring soon
+    positions_expiring_soon = 0
+    position_dicts = []
+
+    for pos in positions:
+        try:
+            dte = 30
+            if pos.expiration:
+                exp_date = datetime.strptime(pos.expiration, "%Y-%m-%d")
+                dte = max(0, (exp_date - datetime.now()).days)
+                if dte <= 7:
+                    positions_expiring_soon += 1
+
+            greeks = get_option_greeks(pos.contract_symbol)
+
+            position_dicts.append({
+                'symbol': pos.symbol,
+                'contract_symbol': pos.contract_symbol,
+                'option_type': pos.option_type,
+                'strike': pos.strike,
+                'days_to_expiry': dte,
+                'unrealized_plpc': pos.unrealized_plpc,
+                'delta': greeks.delta,
+                'theta': greeks.theta
+            })
+        except Exception as e:
+            print(f"  Warning: Error processing {pos.contract_symbol}: {e}")
+
+    # Get market context
+    spy_price = 500.0
+    spy_change_1d = 0.0
+    spy_change_5d = 0.0
+    vix_level = 15.0
+
+    try:
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+
+        client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+        end = datetime.now()
+        start = end - timedelta(days=10)
+        request = StockBarsRequest(
+            symbol_or_symbols=["SPY"],
+            timeframe=TimeFrame.Day,
+            start=start,
+            end=end
+        )
+        bars = client.get_stock_bars(request)
+
+        if "SPY" in bars.data and len(bars.data["SPY"]) >= 2:
+            spy_bars = sorted(bars.data["SPY"], key=lambda x: x.timestamp)
+            spy_price = spy_bars[-1].close
+            spy_change_1d = (spy_bars[-1].close - spy_bars[-2].close) / spy_bars[-2].close
+            if len(spy_bars) >= 6:
+                spy_change_5d = (spy_bars[-1].close - spy_bars[-6].close) / spy_bars[-6].close
+    except Exception as e:
+        print(f"  Warning: Could not get SPY data: {e}")
+
+    # Calculate options exposure
+    options_exposure = sum(pos.market_value for pos in positions)
+    options_exposure_pct = (options_exposure / account['equity'] * 100) if account['equity'] > 0 else 0
+
+    # Max single position
+    max_single_pct = 0
+    if positions and options_exposure > 0:
+        max_single_pct = max(abs(p.market_value) / options_exposure * 100 for p in positions)
+
+    portfolio_input = PortfolioReviewInput(
+        account_equity=account['equity'],
+        cash_available=account['cash'],
+        options_exposure=options_exposure,
+        options_exposure_pct=options_exposure_pct,
+        net_delta=portfolio_greeks.get('net_delta', 0),
+        total_gamma=portfolio_greeks.get('total_gamma', 0),
+        daily_theta=portfolio_greeks.get('daily_theta', 0),
+        total_vega=portfolio_greeks.get('total_vega', 0),
+        positions=position_dicts,
+        sector_allocation=concentration.get('sectors', {}),
+        spy_price=spy_price,
+        spy_change_1d=spy_change_1d,
+        spy_change_5d=spy_change_5d,
+        vix_level=vix_level,
+        max_single_position_pct=max_single_pct,
+        positions_expiring_soon=positions_expiring_soon
+    )
+
+    result = review_portfolio(portfolio_input, use_agent=use_agent)
+
+    # Log results
+    assessment_emoji = {
+        'healthy': '🟢',
+        'moderate_risk': '🟡',
+        'high_risk': '🟠',
+        'critical': '🔴'
+    }
+    print(f"  {assessment_emoji.get(result.overall_assessment, '⚪')} Assessment: {result.overall_assessment}")
+    print(f"  Risk Score: {result.risk_score}/100")
+    print(f"  Summary: {result.summary}")
+
+    if result.risk_factors:
+        print(f"  Risk Factors: {', '.join(result.risk_factors[:3])}")
+
+    if result.roll_suggestions:
+        print(f"  Roll Suggestions: {len(result.roll_suggestions)} positions")
+
+    return {
+        'overall_assessment': result.overall_assessment,
+        'risk_score': result.risk_score,
+        'recommendations': result.recommendations,
+        'rebalancing_needed': result.rebalancing_needed,
+        'rebalancing_actions': result.rebalancing_actions,
+        'roll_suggestions': result.roll_suggestions,
+        'risk_factors': result.risk_factors,
+        'summary': result.summary,
+        'confidence': result.confidence,
+        'agent_used': result.agent_used
+    }
+
+
+def run_options_monitor(use_agent: bool = True) -> Dict:
+    """
+    Run a full options monitoring cycle with position and portfolio review.
+
+    Args:
+        use_agent: Whether to use Claude agent
+
+    Returns:
+        Combined monitoring results
+    """
+    print("=" * 60)
+    print(f"OPTIONS MONITOR - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 60)
+
+    results = {
+        'timestamp': datetime.now().isoformat(),
+        'position_reviews': [],
+        'portfolio_review': None,
+        'actions_taken': [],
+        'alerts': []
+    }
+
+    # 1. Review individual positions
+    print("\n[STEP 1] Reviewing individual positions...")
+    position_reviews = review_options_positions(use_agent=use_agent)
+    results['position_reviews'] = position_reviews
+
+    # Check for critical/high urgency positions
+    urgent_positions = [r for r in position_reviews if r['urgency'] in ['critical', 'high']]
+    if urgent_positions:
+        results['alerts'].append({
+            'type': 'urgent_positions',
+            'count': len(urgent_positions),
+            'positions': [p['contract_symbol'] for p in urgent_positions]
+        })
+
+    # 2. Review portfolio
+    print("\n[STEP 2] Reviewing portfolio...")
+    portfolio_review = review_options_portfolio(use_agent=use_agent)
+    results['portfolio_review'] = portfolio_review
+
+    if portfolio_review['overall_assessment'] in ['high_risk', 'critical']:
+        results['alerts'].append({
+            'type': 'portfolio_risk',
+            'assessment': portfolio_review['overall_assessment'],
+            'risk_score': portfolio_review['risk_score']
+        })
+
+    # 3. Check exits (profit target / stop loss)
+    print("\n[STEP 3] Checking automatic exits...")
+    exit_results = check_options_exits()
+    if exit_results:
+        results['actions_taken'].extend([
+            {'action': 'auto_exit', 'contract': r['contract_symbol'], 'reason': r.get('reason', 'unknown')}
+            for r in exit_results if r.get('success')
+        ])
+
+    # 4. Check expirations
+    print("\n[STEP 4] Checking expiration risk...")
+    expiration_alerts = check_expiration_risk()
+    if expiration_alerts:
+        results['alerts'].append({
+            'type': 'expiration_risk',
+            'positions': [{
+                'contract': a['position'].contract_symbol,
+                'dte': a['dte'],
+                'severity': a['severity']
+            } for a in expiration_alerts]
+        })
+
+    # Summary
+    print("\n" + "=" * 60)
+    print("MONITOR SUMMARY")
+    print("=" * 60)
+    print(f"Positions Reviewed: {len(position_reviews)}")
+    print(f"Urgent Positions: {len(urgent_positions)}")
+    print(f"Portfolio Assessment: {portfolio_review['overall_assessment']} ({portfolio_review['risk_score']}/100)")
+    print(f"Actions Taken: {len(results['actions_taken'])}")
+    print(f"Alerts Generated: {len(results['alerts'])}")
+
+    return results
 
 
 if __name__ == "__main__":

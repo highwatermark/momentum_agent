@@ -133,6 +133,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/buyoption SYMBOL - Buy option\n"
         "/closeoption CONTRACT - Close option\n"
         "/reconcile - Sync DB with Alpaca\n\n"
+        "*Options AI Agents:*\n"
+        "/optionsreview - AI position review\n"
+        "/portfolioreview - AI portfolio review\n"
+        "/optionsmonitor - Full AI monitoring\n\n"
         "*Analytics:*\n"
         "/metrics - Baseline performance\n"
         "/weekly - Last 7 days report\n"
@@ -1336,6 +1340,192 @@ async def cmd_flowperf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 
+# ============== OPTIONS AI AGENTS COMMANDS ==============
+
+@admin_only
+async def cmd_optionsreview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Review options positions using AI agent"""
+    await update.message.reply_text("⏳ Reviewing options positions with AI agent...")
+
+    try:
+        from options_executor import review_options_positions
+
+        results = review_options_positions(use_agent=True)
+
+        if not results:
+            await update.message.reply_text("📭 No options positions to review.")
+            return
+
+        msg = "🔍 *Options Position Review*\n\n"
+
+        # Group by urgency
+        critical = [r for r in results if r['urgency'] == 'critical']
+        high = [r for r in results if r['urgency'] == 'high']
+        medium = [r for r in results if r['urgency'] == 'medium']
+        low = [r for r in results if r['urgency'] == 'low']
+
+        if critical:
+            msg += "🔴 *CRITICAL - Act Now:*\n"
+            for r in critical:
+                msg += f"• {r['contract_symbol'][:20]}\n"
+                msg += f"  {r['recommendation']}: {r['reasoning'][:80]}...\n"
+            msg += "\n"
+
+        if high:
+            msg += "🟠 *HIGH - Act Today:*\n"
+            for r in high:
+                msg += f"• {r['contract_symbol'][:20]}\n"
+                msg += f"  {r['recommendation']}: {r['reasoning'][:80]}...\n"
+            msg += "\n"
+
+        if medium:
+            msg += "🟡 *MEDIUM - Monitor:*\n"
+            for r in medium:
+                msg += f"• {r['contract_symbol'][:20]}: {r['recommendation']}\n"
+            msg += "\n"
+
+        if low:
+            msg += f"🟢 *LOW - Healthy:* {len(low)} positions\n\n"
+
+        # Summary
+        agent_used = sum(1 for r in results if r.get('agent_used', False))
+        msg += f"_Agent used: {agent_used}/{len(results)} reviews_"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Options review error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+@admin_only
+async def cmd_portfolioreview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Review options portfolio using AI agent"""
+    await update.message.reply_text("⏳ Analyzing options portfolio with AI agent...")
+
+    try:
+        from options_executor import review_options_portfolio
+
+        result = review_options_portfolio(use_agent=True)
+
+        # Assessment emoji
+        assessment_emoji = {
+            'healthy': '🟢',
+            'moderate_risk': '🟡',
+            'high_risk': '🟠',
+            'critical': '🔴'
+        }
+
+        emoji = assessment_emoji.get(result['overall_assessment'], '⚪')
+
+        msg = f"{emoji} *Options Portfolio Review*\n\n"
+        msg += f"*Assessment:* {result['overall_assessment'].replace('_', ' ').title()}\n"
+        msg += f"*Risk Score:* {result['risk_score']}/100\n\n"
+
+        if result['summary']:
+            msg += f"*Summary:*\n{result['summary']}\n\n"
+
+        if result['risk_factors']:
+            msg += "*Risk Factors:*\n"
+            for rf in result['risk_factors'][:5]:
+                msg += f"• {rf}\n"
+            msg += "\n"
+
+        if result['rebalancing_needed'] and result['rebalancing_actions']:
+            msg += "⚠️ *Rebalancing Recommended:*\n"
+            for action in result['rebalancing_actions'][:3]:
+                msg += f"• {action}\n"
+            msg += "\n"
+
+        if result['roll_suggestions']:
+            msg += "🔄 *Roll Suggestions:*\n"
+            for roll in result['roll_suggestions'][:3]:
+                contract = roll.get('contract', 'N/A')
+                reason = roll.get('reason', '')
+                msg += f"• {contract[:20]}: {reason}\n"
+            msg += "\n"
+
+        if result['recommendations']:
+            msg += "*Actions:*\n"
+            for rec in result['recommendations'][:3]:
+                priority = rec.get('priority', 'medium')
+                action = rec.get('action', 'N/A')
+                p_emoji = "🔴" if priority == 'high' else "🟡" if priority == 'medium' else "🟢"
+                msg += f"{p_emoji} {action}\n"
+
+        agent_str = "AI Agent" if result.get('agent_used', False) else "Rules-based"
+        msg += f"\n_Analysis: {agent_str} (confidence: {result.get('confidence', 0):.0%})_"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Portfolio review error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+@admin_only
+async def cmd_optionsmonitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run full options monitoring cycle with AI"""
+    await update.message.reply_text("⏳ Running full options monitoring cycle...")
+
+    try:
+        from options_executor import run_options_monitor
+
+        results = run_options_monitor(use_agent=True)
+
+        # Build summary message
+        msg = "📊 *Options Monitor Complete*\n\n"
+
+        # Position reviews summary
+        position_reviews = results.get('position_reviews', [])
+        urgent = sum(1 for r in position_reviews if r['urgency'] in ['critical', 'high'])
+        msg += f"*Positions Reviewed:* {len(position_reviews)}\n"
+        if urgent > 0:
+            msg += f"⚠️ *Urgent positions:* {urgent}\n"
+        msg += "\n"
+
+        # Portfolio review summary
+        portfolio = results.get('portfolio_review', {})
+        if portfolio:
+            assessment_emoji = {
+                'healthy': '🟢',
+                'moderate_risk': '🟡',
+                'high_risk': '🟠',
+                'critical': '🔴'
+            }
+            emoji = assessment_emoji.get(portfolio.get('overall_assessment', 'unknown'), '⚪')
+            msg += f"*Portfolio:* {emoji} {portfolio.get('overall_assessment', 'N/A')}\n"
+            msg += f"Risk Score: {portfolio.get('risk_score', 0)}/100\n\n"
+
+        # Actions taken
+        actions = results.get('actions_taken', [])
+        if actions:
+            msg += f"*Actions Taken:* {len(actions)}\n"
+            for action in actions[:5]:
+                msg += f"• {action.get('action', 'N/A')}: {action.get('contract', 'N/A')[:15]}\n"
+            msg += "\n"
+
+        # Alerts
+        alerts = results.get('alerts', [])
+        if alerts:
+            msg += f"*Alerts:* {len(alerts)}\n"
+            for alert in alerts:
+                alert_type = alert.get('type', 'unknown')
+                if alert_type == 'urgent_positions':
+                    msg += f"🔴 {alert.get('count', 0)} urgent positions\n"
+                elif alert_type == 'portfolio_risk':
+                    msg += f"⚠️ Portfolio risk: {alert.get('assessment', 'N/A')}\n"
+                elif alert_type == 'expiration_risk':
+                    positions = alert.get('positions', [])
+                    msg += f"⏰ {len(positions)} positions expiring soon\n"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Options monitor error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
 @admin_only
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle natural language messages"""
@@ -1414,6 +1604,11 @@ def main():
     app.add_handler(CommandHandler("buyoption", cmd_buyoption))
     app.add_handler(CommandHandler("closeoption", cmd_closeoption))
     app.add_handler(CommandHandler("reconcile", cmd_reconcile))
+
+    # Options AI agent handlers
+    app.add_handler(CommandHandler("optionsreview", cmd_optionsreview))
+    app.add_handler(CommandHandler("portfolioreview", cmd_portfolioreview))
+    app.add_handler(CommandHandler("optionsmonitor", cmd_optionsmonitor))
 
     # Natural language handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

@@ -2,6 +2,315 @@
 
 ---
 
+## Session 13: Options AI Agents Implementation (February 3, 2026)
+
+### Overview
+
+Implemented three Claude-powered AI agents for options position management with rules-based fallbacks when the agent is unavailable. This addresses a major blind spot identified in the systems review where options trading lacked the AI decision-making present in stock trading.
+
+### New File: `options_agent.py` (~700 lines)
+
+Contains three specialized agents:
+
+| Agent | Purpose |
+|-------|---------|
+| **Options Position Reviewer** | Review individual positions, recommend HOLD/CLOSE/ROLL/TRIM |
+| **Options Position Sizer** | Calculate optimal contract quantity based on portfolio state |
+| **Options Portfolio Manager** | Aggregate portfolio review with risk scoring |
+
+### Agent 1: Options Position Reviewer
+
+**Decisions:** HOLD, CLOSE, ROLL, TRIM
+
+**System Prompt Key Rules:**
+
+```
+CLOSE signals (High Priority):
+- DTE <= 3 and position profitable (lock gains before theta crush)
+- DTE <= 3 and OTM (avoid expiring worthless)
+- Loss exceeds 50% of premium paid
+- Underlying moved significantly against position
+- Gamma risk too high (ATM with < 5 DTE)
+
+ROLL signals:
+- DTE <= 7 and want to maintain exposure
+- Profitable but theta decay accelerating
+- Prefer rolling to same strike, 3-4 weeks out
+
+HOLD signals:
+- Thesis intact and DTE > 10
+- Position profitable but has room to run
+- Theta decay acceptable relative to potential gain
+
+TRIM signals:
+- Position too large relative to portfolio
+- Want to lock in partial profits
+```
+
+**Urgency Levels:**
+- `critical`: Act immediately (expiring today/tomorrow)
+- `high`: Act within hours (DTE <= 3)
+- `medium`: Act within 1-2 days (DTE <= 7)
+- `low`: Monitor but no action needed
+
+**Risk Factors Assessed:**
+1. Theta Risk (daily decay vs potential)
+2. Gamma Risk (delta swings near expiry)
+3. Vega Risk (IV changes impact)
+4. Directional Risk (delta vs market)
+5. Time Risk (DTE and theta acceleration)
+6. Liquidity Risk (ability to exit)
+
+### Agent 2: Options Position Sizer
+
+**System Prompt Key Rules:**
+
+```
+Base Sizing:
+- Never risk > 2% of portfolio on single options trade
+- Maximum 10% total portfolio in options
+- Consider existing Greeks exposure
+- Account for sector concentration
+
+Increase size when:
+- Signal score >= 15 (high conviction)
+- IV rank < 30% (cheap premium)
+- Portfolio delta is low
+- Sector underweight
+- Strong trend alignment
+
+Decrease size when:
+- Signal score < 10 (lower conviction)
+- IV rank > 50% (expensive premium)
+- Would create sector concentration > 50%
+- Portfolio already has high theta decay
+- Short DTE (< 14 days)
+- High gamma exposure near expiry
+
+Maximum Constraints:
+- Single underlying: Max 30% of options allocation
+- Single sector: Max 50% of options allocation
+- Max contracts per trade: 10
+```
+
+**Greeks Impact Assessment:**
+- Calculates delta impact on portfolio
+- Assesses theta impact (daily $ decay)
+- Considers gamma concentration
+- Evaluates vega exposure vs IV environment
+
+### Agent 3: Options Portfolio Manager
+
+**Health Levels:** healthy, moderate_risk, high_risk, critical
+
+**Risk Scoring (0-100 points):**
+
+| Component | Points | Criteria |
+|-----------|--------|----------|
+| Theta decay | 0-20 | Daily decay as % of portfolio |
+| Gamma concentration | 0-20 | High gamma near expiry |
+| Delta imbalance | 0-20 | Net delta per $100K |
+| Concentration risk | 0-20 | Single sector/position |
+| Expiration risk | 0-20 | Multiple positions same week |
+
+**Key Metrics Monitored:**
+- **Net Delta**: Healthy < |50| per $100K, Concerning > |100|
+- **Daily Theta**: Healthy < 0.1% portfolio/day, Concerning > 0.2%
+- **Sector Concentration**: Max 50% single sector
+
+**Rebalancing Triggers:**
+- Net delta > |100| per $100K
+- Single sector > 50%
+- Daily theta > 0.2% of portfolio
+- Multiple positions DTE < 7
+
+### Fallback Logic
+
+Each agent has rules-based fallback when Claude is unavailable:
+
+```python
+def review_position(position, use_agent=True):
+    if use_agent:
+        result = _review_position_with_agent(position)
+        if result:
+            return result
+        logger.warning("Agent failed, falling back to rules")
+
+    return _review_position_rules_based(position)
+```
+
+**Position Reviewer Fallback:**
+- DTE <= 1: CLOSE (critical)
+- DTE <= 3 + profit > 30%: CLOSE
+- DTE <= 3 + loss > 40%: CLOSE
+- DTE <= 7 + profit > 50%: CLOSE
+- Loss > 50%: CLOSE
+- Otherwise: HOLD
+
+**Position Sizer Fallback:**
+- Base: 2% of equity / contract cost
+- Signal score >= 15: +50%
+- Signal score >= 12: +25%
+- Signal score < 8: -50%
+- Sector concentration > 35%: -50%
+- Cap at max_contracts_per_trade (10)
+
+**Portfolio Manager Fallback:**
+- Calculates risk score from thresholds
+- Identifies positions needing roll (DTE < 7)
+- Checks sector concentration limits
+
+### Integration with `options_executor.py`
+
+**Updated Functions:**
+
+1. `calculate_options_position_size()` - Now accepts additional parameters:
+   ```python
+   def calculate_options_position_size(
+       account_equity, option_price, conviction=0.5,
+       underlying=None, option_type="call", strike=0,
+       expiration=None, signal_score=0, use_agent=True
+   )
+   ```
+
+2. `execute_flow_trade()` - Now uses agent-based sizing:
+   ```python
+   quantity = calculate_options_position_size(
+       account_equity=account["equity"],
+       option_price=estimated_price,
+       conviction=enriched_signal.conviction,
+       underlying=signal.symbol,
+       option_type=signal.option_type,
+       strike=contract['strike'],
+       expiration=contract['expiration'],
+       signal_score=signal.score,
+       use_agent=True
+   )
+   ```
+
+**New Functions Added:**
+
+| Function | Description |
+|----------|-------------|
+| `review_options_positions()` | Review all positions with AI agent |
+| `review_options_portfolio()` | Portfolio-level AI review |
+| `run_options_monitor()` | Full monitoring cycle |
+
+### New Telegram Bot Commands
+
+| Command | Description |
+|---------|-------------|
+| `/optionsreview` | AI-powered review of each position |
+| `/portfolioreview` | AI portfolio risk assessment |
+| `/optionsmonitor` | Run full monitoring cycle |
+
+### Logging Infrastructure
+
+**File Logging:**
+```
+logs/options_agent.log
+```
+
+**Database Table:**
+```sql
+CREATE TABLE options_agent_logs (
+    id INTEGER PRIMARY KEY,
+    timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+    agent_name TEXT NOT NULL,
+    input_data TEXT,      -- JSON
+    output_data TEXT,     -- JSON
+    agent_used INTEGER,   -- 1 if Claude, 0 if fallback
+    fallback_reason TEXT,
+    execution_time_ms REAL,
+    confidence REAL
+)
+```
+
+### Data Classes Added
+
+**Input Classes:**
+- `PositionReviewInput` - Position data with Greeks and context
+- `PositionSizingInput` - Trade details and portfolio state
+- `PortfolioReviewInput` - Account state with aggregate Greeks
+
+**Output Classes:**
+- `PositionReviewResult` - Recommendation with reasoning
+- `PositionSizingResult` - Contract count with risk factors
+- `PortfolioReviewResult` - Assessment with recommendations
+
+### Sample Agent Outputs
+
+**Position Review:**
+```json
+{
+    "recommendation": "ROLL",
+    "urgency": "medium",
+    "reasoning": "Position is profitable (+31%) but DTE=5 with accelerating theta decay. Roll to maintain exposure while avoiding gamma risk.",
+    "risk_factors": ["theta_acceleration", "gamma_near_expiry"],
+    "roll_to_expiration": "2024-04-19",
+    "confidence": 0.85
+}
+```
+
+**Position Sizing:**
+```json
+{
+    "recommended_contracts": 3,
+    "max_contracts": 5,
+    "position_value": 4650.00,
+    "position_pct_of_portfolio": 4.65,
+    "reasoning": "High conviction signal (14/20), sector underweight, reasonable IV rank. Sizing at 1.5x base due to signal quality.",
+    "delta_impact": 150.0,
+    "theta_impact": -25.50,
+    "confidence": 0.78
+}
+```
+
+**Portfolio Review:**
+```json
+{
+    "overall_assessment": "moderate_risk",
+    "risk_score": 42,
+    "rebalancing_needed": false,
+    "roll_suggestions": [
+        {"contract": "AAPL240315C175", "roll_to": "2024-04-19", "reason": "DTE=5"}
+    ],
+    "risk_factors": ["high_tech_concentration", "theta_elevated"],
+    "summary": "Portfolio has moderate risk with 65% tech concentration and elevated theta. Consider closing AAPL position approaching expiry.",
+    "confidence": 0.82
+}
+```
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `options_agent.py` | **NEW** - All three agents (~700 lines) |
+| `options_executor.py` | Added agent integration, 3 new review functions |
+| `bot.py` | Added 3 new commands, updated help |
+
+### Testing
+
+Run the test suite:
+```bash
+./venv/bin/python options_agent.py
+```
+
+Tests:
+1. Position Review (with/without agent)
+2. Position Sizing (with/without agent)
+3. Portfolio Review (with/without agent)
+
+### Configuration
+
+Agents use existing config from `config.py`:
+- `OPTIONS_CONFIG` - Position limits, sizing percentages
+- `OPTIONS_SAFETY` - Spread limits, concentration limits
+
+No new configuration required.
+
+---
+
 ## Session 12: DQN Backfill & Data-Driven Prompt Review (January 20, 2026)
 
 ### Overview

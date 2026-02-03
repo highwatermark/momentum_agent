@@ -54,6 +54,7 @@ An automated momentum trading system that scans for high-momentum stocks, uses C
 | `flow_scanner.py` | Unusual Whales API client for options flow signals |
 | `flow_analyzer.py` | Signal enrichment and Claude thesis generation |
 | `options_executor.py` | Alpaca options trading and position management |
+| `options_agent.py` | AI agents for position review, sizing, and portfolio management |
 | `flow_job.py` | Automated options flow job (scan, analyze, execute, exit checks) |
 
 ## Services
@@ -111,9 +112,20 @@ sudo systemctl restart position-monitor.timer
 | `/flow` | Scan options flow from Unusual Whales |
 | `/analyze` | Analyze top signals with Claude thesis |
 | `/options` | View options positions & performance |
+| `/greeks` | View portfolio Greeks |
+| `/expirations` | DTE alerts and roll suggestions |
+| `/flowperf` | Signal factor performance stats |
 | `/buyoption SYMBOL` | Execute options trade (requires confirm) |
 | `/closeoption CONTRACT` | Close options position |
 | `/reconcile` | Sync options DB with Alpaca positions |
+
+### Options AI Agents Commands
+
+| Command | Description |
+|---------|-------------|
+| `/optionsreview` | AI-powered review of each position with HOLD/CLOSE/ROLL/TRIM recommendations |
+| `/portfolioreview` | AI portfolio risk assessment with risk scoring and rebalancing suggestions |
+| `/optionsmonitor` | Run full AI monitoring cycle (positions + portfolio + exits + expirations) |
 
 ## Configuration
 
@@ -745,6 +757,242 @@ OPTIONS_SAFETY = {
 | max_gain_pct, max_loss_pct | Trade extremes |
 | actual_pnl_pct, holding_days | Final outcome |
 | was_winner, hit_target, hit_stop | Result flags |
+
+## Options AI Agents (Added 2026-02-03)
+
+Three Claude-powered AI agents for intelligent options position management with rules-based fallbacks.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      TELEGRAM BOT                               │
+│     /optionsreview  /portfolioreview  /optionsmonitor           │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │
+          ┌───────────────┼───────────────┐
+          ▼               ▼               ▼
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│    POSITION     │ │    POSITION     │ │   PORTFOLIO     │
+│    REVIEWER     │ │     SIZER       │ │    MANAGER      │
+│                 │ │                 │ │                 │
+│ - HOLD/CLOSE/   │ │ - Contract qty  │ │ - Risk scoring  │
+│   ROLL/TRIM     │ │ - Greeks impact │ │ - Rebalancing   │
+│ - Urgency level │ │ - Sector check  │ │ - Roll suggests │
+│ - Risk factors  │ │ - Conviction    │ │ - Concentration │
+└─────────────────┘ └─────────────────┘ └─────────────────┘
+          │                 │                   │
+          └─────────────────┴───────────────────┘
+                            │
+              ┌─────────────┴─────────────┐
+              │     options_agent.py      │
+              │  Claude Agent + Fallback  │
+              └───────────────────────────┘
+```
+
+### Agent 1: Options Position Reviewer
+
+Reviews individual positions and recommends actions.
+
+**Decisions:**
+| Decision | When |
+|----------|------|
+| **HOLD** | Thesis intact, DTE > 10, theta acceptable |
+| **CLOSE** | DTE <= 3 and profitable/OTM, loss > 50%, high gamma risk |
+| **ROLL** | DTE <= 7 and want to maintain exposure |
+| **TRIM** | Position too large, lock in partial profits |
+
+**Urgency Levels:**
+| Level | Criteria | Action |
+|-------|----------|--------|
+| `critical` | Expiring today/tomorrow, large loss | Act immediately |
+| `high` | DTE <= 3, significant risk | Act within hours |
+| `medium` | DTE <= 7, moderate risk | Act within 1-2 days |
+| `low` | Normal parameters | Monitor only |
+
+**Risk Factors Assessed:**
+- Theta Risk (daily decay vs potential gain)
+- Gamma Risk (delta swings near expiry)
+- Vega Risk (IV changes impact)
+- Directional Risk (delta vs market conditions)
+- Time Risk (DTE and theta acceleration)
+- Liquidity Risk (ability to exit at fair price)
+
+### Agent 2: Options Position Sizer
+
+Calculates optimal contract quantity for new trades.
+
+**Base Rules:**
+- Never risk > 2% of portfolio on single options trade
+- Maximum 10% total portfolio in options
+- Consider existing Greeks exposure
+- Account for sector concentration
+
+**Size Adjustments:**
+
+| Factor | Effect | Example |
+|--------|--------|---------|
+| Signal score >= 15 | +50% size | High conviction |
+| Signal score >= 12 | +25% size | Good signal |
+| Signal score < 10 | -50% size | Weak signal |
+| IV rank < 30% | +25% size | Cheap premium |
+| IV rank > 50% | -25% size | Expensive premium |
+| Sector > 35% | -50% size | Concentration risk |
+| Short DTE < 14 | -25% size | Theta risk |
+
+**Maximum Constraints:**
+- Single underlying: Max 30% of options allocation
+- Single sector: Max 50% of options allocation
+- Max contracts per trade: 10
+
+**Greeks Impact Assessment:**
+The agent calculates expected portfolio changes:
+- Delta impact (directional shift)
+- Theta impact (daily decay change)
+- Gamma concentration
+- Vega exposure vs IV environment
+
+### Agent 3: Options Portfolio Manager
+
+Reviews overall portfolio and provides strategic recommendations.
+
+**Health Levels:**
+| Level | Risk Score | Action |
+|-------|------------|--------|
+| `healthy` | 0-25 | No action needed |
+| `moderate_risk` | 26-50 | Monitor closely |
+| `high_risk` | 51-75 | Action recommended |
+| `critical` | 76-100 | Immediate action required |
+
+**Risk Scoring (0-100):**
+| Component | Points | Criteria |
+|-----------|--------|----------|
+| Theta decay | 0-20 | Daily decay as % of portfolio |
+| Gamma concentration | 0-20 | High gamma positions near expiry |
+| Delta imbalance | 0-20 | Net delta per $100K equity |
+| Concentration risk | 0-20 | Single sector/position exposure |
+| Expiration risk | 0-20 | Multiple positions same week |
+
+**Key Metrics Monitored:**
+- **Net Delta**: Healthy < |50| per $100K, Concerning > |100|
+- **Daily Theta**: Healthy < 0.1% portfolio/day, Concerning > 0.2%
+- **Sector Concentration**: Max 50% single sector
+
+**Rebalancing Triggers:**
+- Net delta > |100| per $100K equity
+- Single sector > 50% of options
+- Daily theta > 0.2% of portfolio
+- Multiple positions DTE < 7
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `/optionsreview` | AI review of each position with urgency ratings |
+| `/portfolioreview` | AI portfolio risk assessment with recommendations |
+| `/optionsmonitor` | Full monitoring cycle (positions + portfolio + exits) |
+
+### Fallback Logic
+
+When Claude agent is unavailable, the system falls back to rules-based decisions:
+
+**Position Reviewer Fallback:**
+```
+DTE <= 1 → CLOSE (critical)
+DTE <= 3 + profit > 30% → CLOSE
+DTE <= 3 + loss > 40% → CLOSE
+DTE <= 7 + profit > 50% → CLOSE
+Loss > 50% → CLOSE
+Otherwise → HOLD
+```
+
+**Position Sizer Fallback:**
+```
+Base = 2% of equity / contract cost
+Signal >= 15 → ×1.5
+Signal >= 12 → ×1.25
+Signal < 8 → ×0.5
+Sector > 35% → ×0.5
+Cap at max_contracts (10)
+```
+
+**Portfolio Manager Fallback:**
+- Calculates risk score from thresholds
+- Identifies positions needing roll (DTE < 7)
+- Checks sector concentration limits
+
+### Sample Output
+
+**Position Review:**
+```
+🔍 Options Position Review
+
+🔴 CRITICAL - Act Now:
+• AAPL240315C00175000
+  CLOSE: Expiring in 2 days with 31% profit - lock gains
+
+🟡 MEDIUM - Monitor:
+• NVDA240419C00500000: HOLD
+
+🟢 LOW - Healthy: 1 position
+
+Agent used: 2/3 reviews
+```
+
+**Portfolio Review:**
+```
+🟡 Options Portfolio Review
+
+Assessment: Moderate Risk
+Risk Score: 42/100
+
+Summary: Portfolio has moderate risk with 65% tech concentration
+
+Risk Factors:
+• High tech sector concentration
+• Elevated theta decay ($45/day)
+
+Roll Suggestions:
+• AAPL240315C175: Roll to 2024-04-19 (DTE=5)
+
+Analysis: AI Agent (confidence: 82%)
+```
+
+### Logging
+
+**File Logging:**
+```
+logs/options_agent.log
+```
+
+**Database Table:**
+```sql
+CREATE TABLE options_agent_logs (
+    id INTEGER PRIMARY KEY,
+    timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+    agent_name TEXT NOT NULL,
+    input_data TEXT,      -- JSON
+    output_data TEXT,     -- JSON
+    agent_used INTEGER,   -- 1 if Claude, 0 if fallback
+    fallback_reason TEXT,
+    execution_time_ms REAL,
+    confidence REAL
+)
+```
+
+### Testing
+
+```bash
+# Run agent tests
+./venv/bin/python options_agent.py
+
+# Tests included:
+# 1. Position Review (with/without agent)
+# 2. Position Sizing (with/without agent)
+# 3. Portfolio Review (with/without agent)
+```
+
+---
 
 ## Background Jobs (DQL Training)
 
