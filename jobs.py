@@ -227,6 +227,29 @@ def cleanup_old_data():
         print(f"  Error cleaning up data: {e}")
 
 
+def backfill_dqn_experiences_job():
+    """
+    Run daily after market close - add new closed trades to DQN experiences.
+    This populates training data for the DQN model.
+    """
+    from db import backfill_dqn_experiences, get_dqn_stats
+
+    print(f"[{datetime.now()}] Backfilling DQN experiences...")
+
+    try:
+        backfilled, skipped = backfill_dqn_experiences()
+        print(f"  Backfilled {backfilled} new experiences, skipped {skipped}")
+
+        # Print current stats
+        stats = get_dqn_stats()
+        print(f"  DQN Stats: {stats['total']} total experiences, "
+              f"{stats['win_rate']:.1f}% win rate, "
+              f"avg reward: {stats['avg_reward']:.4f}")
+
+    except Exception as e:
+        print(f"  Error backfilling DQN experiences: {e}")
+
+
 def run_all_daily_jobs():
     """Run all daily jobs in sequence"""
     print("=" * 60)
@@ -237,6 +260,7 @@ def run_all_daily_jobs():
     update_outcomes()
     update_position_tracking()
     calculate_trade_rewards()
+    backfill_dqn_experiences_job()
 
     print("=" * 60)
     print("Daily jobs complete.")
@@ -252,6 +276,7 @@ def main():
             "update_outcomes",
             "update_tracking",
             "calculate_rewards",
+            "backfill_dqn",
             "cleanup",
             "all"
         ],
@@ -268,6 +293,8 @@ def main():
         update_position_tracking()
     elif args.job == "calculate_rewards":
         calculate_trade_rewards()
+    elif args.job == "backfill_dqn":
+        backfill_dqn_experiences_job()
     elif args.job == "cleanup":
         cleanup_old_data()
     elif args.job == "all":

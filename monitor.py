@@ -12,6 +12,7 @@ from alpaca.data.timeframe import TimeFrame
 
 from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, get_runtime_config
 from executor import get_positions, close_position
+from db import get_trade_by_symbol
 import pytz
 
 load_dotenv()
@@ -337,8 +338,26 @@ def run_monitor():
 
         # Handle based on score
         if result["score"] >= auto_close_threshold and auto_close_enabled:
-            # Strong reversal - auto-close position
-            print(f"  🚨 STRONG REVERSAL (score >= {auto_close_threshold}) - AUTO-CLOSING POSITION!")
+            # Calculate days held before auto-closing
+            trade = get_trade_by_symbol(symbol, "open")
+            days_held = 0
+            if trade and trade.get('entry_date'):
+                try:
+                    entry_date = datetime.fromisoformat(trade['entry_date'][:10])
+                    days_held = (datetime.now() - entry_date).days
+                except Exception:
+                    pass
+
+            # Skip auto-close if held < 2 days (let positions develop)
+            if days_held < 2:
+                print(f"  ⏳ MIN HOLD PROTECTION: Skipping auto-close (held {days_held} days, need 2+)")
+                send_telegram_alert(symbol, result["score"], result["signals"], pnl_pct, auto_closed=False)
+                result["auto_closed"] = False
+                results.append(result)
+                continue
+
+            # Strong reversal with sufficient hold time - auto-close position
+            print(f"  🚨 STRONG REVERSAL (score >= {auto_close_threshold}, held {days_held} days) - AUTO-CLOSING!")
             close_result = close_position(
                 symbol,
                 reason=f"auto_reversal_score_{result['score']}",

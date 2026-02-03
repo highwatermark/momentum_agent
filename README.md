@@ -223,6 +223,12 @@ The monitor calculates a **reversal score** (0-13) for position alerts:
 | 3-4 | Weak | Telegram alert sent, manual close recommended |
 | **5+** | **Strong** | **AUTO-CLOSE** - Position automatically closed + logged as poor signal |
 
+**Minimum Hold Protection** (added 2026-02-03):
+- Positions held < 2 days are **protected from auto-close**
+- Alerts still sent, but no automatic exit
+- Allows positions to survive temporary whipsaws/pullbacks
+- Reasoning: Same-day exits had 6.2% win rate vs 62.5% for 3+ day holds
+
 The auto-close feature can be configured via Telegram bot commands (`/set autoclose on|off`, `/set threshold N`).
 
 ## Self-Learning Loop
@@ -484,7 +490,8 @@ Background jobs run via cron to collect training data for future DQL model devel
 | Job | Schedule | Time (ET) | Purpose |
 |-----|----------|-----------|---------|
 | `daily_snapshot` | 21:05 M-F | 4:05 PM | Log daily performance & equity |
-| `update_outcomes` | 21:10 M-F | 4:10 PM | Fill in price_Xd_later for candidates |
+| `update_outcomes` | 22:30 M-F | 5:30 PM | Fill in price_Xd_later for candidates |
+| `backfill_dqn` | 22:45 M-F | 5:45 PM | Add closed trades to DQN experiences (added 2026-02-03) |
 | `update_tracking` | */30 14-21 M-F | Every 30min | Track max gain/drawdown for open positions |
 | `cleanup` | 0:00 Sunday | Midnight | Remove data older than 90 days |
 
@@ -497,6 +504,7 @@ Background jobs run via cron to collect training data for future DQL model devel
 # Run individual jobs
 ./venv/bin/python jobs.py daily_snapshot
 ./venv/bin/python jobs.py update_outcomes
+./venv/bin/python jobs.py backfill_dqn
 ./venv/bin/python jobs.py update_tracking
 ./venv/bin/python jobs.py cleanup
 ```
