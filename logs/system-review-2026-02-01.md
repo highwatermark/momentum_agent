@@ -540,3 +540,76 @@ AAPL260220C00100000:
 ```
 
 **Status**: Tested and deployed, ready for 2026-02-04 market session.
+
+### 2026-02-03 - Options Greeks & Learning Loop (MEDIUM Priority)
+
+**Change**: Implemented MEDIUM priority enhancements - Greeks tracking, DTE alerts, sector concentration, earnings blackout
+
+**Files Modified**:
+- `options_executor.py`: Added Greeks calculation, sector concentration, DTE alerts, earnings blackout
+- `db.py`: Added Greeks columns to options_trades, added flow_signal_outcomes table
+- `bot.py`: Added `/greeks`, `/expirations`, `/flowperf` commands
+- `config.py`: Added SECTOR_MAP
+
+**New Functions (options_executor.py)**:
+
+| Function | Purpose |
+|----------|---------|
+| `estimate_greeks()` | Black-Scholes Greeks calculation |
+| `get_option_greeks()` | Get Greeks for specific contract |
+| `get_portfolio_greeks()` | Aggregate Greeks across all positions |
+| `check_sector_concentration()` | Analyze sector allocation |
+| `can_add_position()` | Check if new position violates limits |
+| `check_expiration_risk()` | Find positions approaching expiration |
+| `suggest_roll()` | Suggest roll for expiring position |
+| `check_earnings_blackout()` | Block trades near earnings |
+
+**Greeks Logged at Entry/Exit**:
+| Field | Description |
+|-------|-------------|
+| entry/exit_delta | Delta at open/close |
+| entry/exit_gamma | Gamma at open/close |
+| entry/exit_theta | Theta at open/close |
+| entry/exit_vega | Vega at open/close |
+| entry/exit_iv | Implied volatility |
+| entry/exit_underlying_price | Stock price |
+| entry/exit_dte | Days to expiration |
+
+**New Database Table (flow_signal_outcomes)**:
+- Tracks every closed options trade outcome
+- Records signal characteristics: sweep, ask_side, floor, opening, premium_tier, vol_oi_tier
+- Records entry Greeks: delta, theta, IV
+- Records outcomes: max_price, min_price, actual_pnl, holding_days
+- Enables factor analysis: which signals correlate with wins?
+
+**New Bot Commands**:
+| Command | Description |
+|---------|-------------|
+| `/greeks` | Portfolio Greeks with sector allocation |
+| `/expirations` | DTE alerts with roll suggestions |
+| `/flowperf` | Signal factor performance analysis |
+
+**Sector Concentration Limits**:
+- Max single sector: 50%
+- Max single underlying: 30%
+- New positions blocked if limits exceeded
+
+**DTE Alert Thresholds**:
+| DTE | Severity | Action |
+|-----|----------|--------|
+| <= 0 | CRITICAL | "EXPIRED - Close immediately" |
+| <= 3 | HIGH | "Expiring - Consider closing or rolling" |
+| <= 7 | MEDIUM | "Monitor theta decay" |
+
+**Earnings Blackout**:
+- Blocks trades 2 days before earnings
+- Uses Unusual Whales earnings calendar
+- Configurable via `OPTIONS_SAFETY['earnings_blackout_days']`
+
+**Signal Factor Performance Analysis**:
+- Tracks win rate by signal score tier (elite 15+, high 12-14, etc.)
+- Tracks win rate by factor (sweep, ask side, floor, opening)
+- Tracks win rate by premium tier and vol/oi tier
+- Accessible via `/flowperf` command
+
+**Status**: Tested and deployed, bot running (PID 60241).

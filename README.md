@@ -507,14 +507,15 @@ When `skip_buys_when_healthy` is enabled and all positions have reversal score <
 
 ## Options Flow Trading (Added 2026-02-03)
 
-Options flow trading system integrated with Unusual Whales API.
+Options flow trading system integrated with Unusual Whales API for institutional-grade options signals.
 
 ### Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                      TELEGRAM BOT                               │
-│  Commands: /flow /analyze /options /buyoption /closeoption      │
+│    /flow /analyze /options /greeks /expirations /flowperf       │
+│         /buyoption /closeoption /reconcile                      │
 └─────────────────────────┬───────────────────────────────────────┘
                           │
           ┌───────────────┼───────────────┐
@@ -525,9 +526,34 @@ Options flow trading system integrated with Unusual Whales API.
 │                 │ │                 │ │                 │
 │ - UW API client │ │ - Alpaca data   │ │ - Find contracts│
 │ - Flow alerts   │ │ - Claude thesis │ │ - Position size │
-│ - Signal scoring│ │ - Recommendations│ │ - Place orders  │
+│ - Signal scoring│ │ - Recommendations│ │ - Greeks calc   │
+│                 │ │                 │ │ - Smart orders  │
 └─────────────────┘ └─────────────────┘ └─────────────────┘
+          │                 │                   │
+          └─────────────────┴───────────────────┘
+                            │
+                            ▼
+              ┌───────────────────────┐
+              │  DATABASE (db.py)     │
+              │  - flow_signals       │
+              │  - options_trades     │
+              │  - flow_signal_outcomes│
+              └───────────────────────┘
 ```
+
+### Options Commands
+
+| Command | Description |
+|---------|-------------|
+| `/flow` | Scan options flow from Unusual Whales |
+| `/analyze` | Analyze top signals with Claude thesis |
+| `/options` | View options positions & performance |
+| `/greeks` | Portfolio Greeks with sector allocation |
+| `/expirations` | DTE alerts with roll suggestions |
+| `/flowperf` | Signal factor performance analysis |
+| `/buyoption SYMBOL` | Execute options trade (requires confirm) |
+| `/closeoption CONTRACT` | Close options position |
+| `/reconcile` | Sync options DB with Alpaca positions |
 
 ### Flow Signal Scoring (0-20)
 
@@ -555,15 +581,94 @@ Minimum score for consideration: **8/20**
 | Minimum Bid | < $0.05 | Block trade |
 | Bid Size | < 10 | Block trade |
 | Order Type | - | Limit orders at mid + 2% |
+| Sector Concentration | > 50% | Block new position |
+| Single Underlying | > 30% | Block new position |
+| Earnings Blackout | 2 days before | Block trade |
+
+### Greeks Tracking
+
+The system calculates and logs Greeks at trade entry and exit for learning:
+
+| Greek | Description | Use |
+|-------|-------------|-----|
+| Delta | Price sensitivity | Directional exposure |
+| Gamma | Delta sensitivity | Risk acceleration |
+| Theta | Time decay | Daily cost of holding |
+| Vega | IV sensitivity | Volatility exposure |
+| IV | Implied volatility | Market expectation |
+
+**Portfolio Greeks** (`/greeks`):
+- **Net Delta**: Aggregate directional exposure (shares equivalent)
+- **Total Theta**: Daily portfolio decay ($)
+- **Sector Allocation**: % exposure by sector with concentration warnings
+
+### DTE Alerts & Roll Suggestions
+
+The `/expirations` command monitors positions approaching expiration:
+
+| DTE | Severity | Message |
+|-----|----------|---------|
+| <= 0 | CRITICAL | "EXPIRED - Close immediately" |
+| <= 3 | HIGH | "Expiring - Consider closing or rolling" |
+| <= 7 | MEDIUM | "Monitor theta decay" |
+
+For HIGH severity, the system suggests rolls:
+- Same strike, 3-4 weeks out
+- Shows roll cost (debit/credit)
+- ITM positions flagged for assignment risk
+
+### Sector Concentration
+
+Positions are categorized by sector to prevent over-concentration:
+
+| Sector | Example Symbols |
+|--------|-----------------|
+| tech | AAPL, MSFT, NVDA, AMD, META |
+| finance | JPM, BAC, GS, V, MA |
+| healthcare | UNH, JNJ, PFE, LLY, MRK |
+| energy | XOM, CVX, COP, SLB |
+| consumer | AMZN, TSLA, HD, NKE, WMT |
+| industrial | CAT, BA, HON, UPS, GE |
+| index | SPY, QQQ, IWM, DIA |
+
+**Limits**:
+- Max single sector: 50% of options portfolio
+- Max single underlying: 30% of options portfolio
+
+### Signal Outcome Learning
+
+Closed trades are logged to `flow_signal_outcomes` for factor analysis:
+
+```
+/flowperf shows:
+- Win rate by score tier (elite 15+, high 12-14, medium 10-11, low 8-9)
+- Win rate by factor (sweep, ask side, floor, opening)
+- Win rate by premium tier (very_high, high, medium, low)
+- Avg P/L and holding period per tier
+```
+
+This enables data-driven refinement of signal weights.
 
 ### Options Workflow
 
 1. **Scan**: `/flow` fetches signals from Unusual Whales
-2. **Filter**: Signals scored and filtered (min 8 points)
-3. **Analyze**: `/analyze` enriches with Alpaca data + Claude thesis
-4. **Execute**: `/buyoption SYMBOL confirm` places limit order
-5. **Monitor**: Check profit target (50%) and stop loss (50%)
-6. **Exit**: `/closeoption CONTRACT` or auto-exit on targets
+2. **Filter**: Signals scored (min 8 points) and ranked
+3. **Analyze**: `/analyze` enriches with:
+   - Alpaca price data and technicals
+   - Claude thesis with conviction score
+   - BUY/SKIP/WATCH recommendation
+4. **Pre-Trade Checks**:
+   - Earnings blackout (2 days before)
+   - Sector concentration limits
+   - Liquidity check (spread < 15%, bid > $0.05)
+5. **Execute**: `/buyoption SYMBOL confirm` places limit order at mid + 2%
+6. **Greeks Logged**: Entry delta, gamma, theta, vega, IV, DTE
+7. **Monitor**:
+   - `/greeks` for portfolio exposure
+   - `/expirations` for DTE alerts
+   - `/options` for P/L tracking
+8. **Exit**: `/closeoption CONTRACT` with exit Greeks logged
+9. **Learn**: Signal outcome recorded to `flow_signal_outcomes`
 
 ### Options Configuration
 
@@ -574,8 +679,50 @@ OPTIONS_CONFIG = {
     "position_size_pct": 0.02,        # 2% of portfolio
     "profit_target_pct": 0.50,        # 50% profit target
     "stop_loss_pct": 0.50,            # 50% stop loss
+    "min_days_to_exp": 14,            # Minimum DTE
+    "max_days_to_exp": 60,            # Maximum DTE
+    "max_portfolio_risk_options": 0.10, # Max 10% in options
+}
+
+OPTIONS_SAFETY = {
+    "max_spread_pct": 15.0,           # Block if spread > 15%
+    "min_bid": 0.05,                  # Block penny options
+    "min_bid_size": 10,               # Minimum liquidity
+    "max_single_sector_pct": 50.0,    # Concentration limit
+    "max_single_underlying_pct": 30.0,
+    "earnings_blackout_days": 2,
+    "roll_alert_dte": 7,              # Alert at 7 DTE
+    "critical_dte": 3,                # Critical at 3 DTE
+    "use_limit_orders": True,         # No market orders
+    "limit_price_buffer_pct": 2.0,    # Mid + 2% for buys
 }
 ```
+
+### Options Database Tables
+
+**options_trades**:
+| Column | Description |
+|--------|-------------|
+| contract_symbol | OCC symbol (e.g., AAPL260220C00175000) |
+| underlying | Stock symbol |
+| option_type | call/put |
+| strike, expiration | Contract details |
+| entry_price, exit_price | Trade prices |
+| entry_delta, entry_theta, entry_iv | Greeks at open |
+| exit_delta, exit_theta, exit_iv | Greeks at close |
+| entry_dte, exit_dte | Days to expiration |
+| signal_score, thesis | Signal data |
+
+**flow_signal_outcomes**:
+| Column | Description |
+|--------|-------------|
+| was_sweep, was_ask_side | Signal factors |
+| was_floor, was_opening | Institutional indicators |
+| premium_tier, vol_oi_tier | Size tiers |
+| entry_delta, entry_theta, entry_iv | Entry Greeks |
+| max_gain_pct, max_loss_pct | Trade extremes |
+| actual_pnl_pct, holding_days | Final outcome |
+| was_winner, hit_target, hit_stop | Result flags |
 
 ## Background Jobs (DQL Training)
 
