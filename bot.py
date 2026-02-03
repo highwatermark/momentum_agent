@@ -127,6 +127,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/flow - Scan options flow\n"
         "/analyze - Analyze with Claude\n"
         "/options - Options positions\n"
+        "/greeks - Portfolio Greeks\n"
+        "/expirations - DTE alerts\n"
+        "/flowperf - Signal factor stats\n"
         "/buyoption SYMBOL - Buy option\n"
         "/closeoption CONTRACT - Close option\n"
         "/reconcile - Sync DB with Alpaca\n\n"
@@ -1158,6 +1161,182 @@ async def cmd_reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_only
+async def cmd_expirations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check expiring options positions"""
+    try:
+        from options_executor import check_expiration_risk, suggest_roll
+
+        alerts = check_expiration_risk()
+
+        if not alerts:
+            await update.message.reply_text("✅ No expiration concerns. All positions have adequate time.")
+            return
+
+        msg = "⏰ *Expiration Alerts*\n\n"
+
+        for alert in alerts:
+            pos = alert["position"]
+            severity = alert["severity"]
+
+            # Severity emoji
+            if severity == "CRITICAL":
+                emoji = "🔴"
+            elif severity == "HIGH":
+                emoji = "🟠"
+            else:
+                emoji = "🟡"
+
+            msg += f"{emoji} *{pos.symbol}* {pos.option_type.upper()} ${pos.strike}\n"
+            msg += f"   DTE: {alert['dte']} | {alert['message']}\n"
+
+            # Show roll suggestion for high severity
+            if alert["action"] in ["close_or_roll", "close"]:
+                roll = suggest_roll(pos)
+                if roll.get("can_roll"):
+                    cost_str = f"${roll['roll_cost']:.2f} debit" if roll["roll_cost"] > 0 else f"${abs(roll['roll_cost']):.2f} credit"
+                    msg += f"   Roll to {roll['new_expiration']}: {cost_str}\n"
+
+            msg += "\n"
+
+        msg += "Use `/closeoption CONTRACT` to close."
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Expirations error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+@admin_only
+async def cmd_greeks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show portfolio Greeks"""
+    await update.message.reply_text("⏳ Calculating portfolio Greeks...")
+
+    try:
+        from options_executor import get_portfolio_greeks, check_sector_concentration
+
+        greeks = get_portfolio_greeks()
+        concentration = check_sector_concentration()
+
+        if not greeks["positions"]:
+            await update.message.reply_text("📭 No options positions to analyze.")
+            return
+
+        msg = "📊 *Portfolio Greeks*\n\n"
+
+        # Aggregate Greeks
+        msg += "*Net Exposure:*\n"
+        delta_emoji = "📈" if greeks["net_delta"] > 0 else "📉" if greeks["net_delta"] < 0 else "➡️"
+        msg += f"{delta_emoji} Delta: {greeks['net_delta']:+.0f} shares equivalent\n"
+        msg += f"🔄 Gamma: {greeks['total_gamma']:.2f}\n"
+        msg += f"⏱️ Theta: ${greeks['daily_theta']:+.2f}/day\n"
+        msg += f"📊 Vega: {greeks['total_vega']:.2f}\n\n"
+
+        # Warnings
+        warnings = []
+        if abs(greeks["net_delta"]) > 500:
+            warnings.append(f"⚠️ High delta exposure ({greeks['net_delta']:+.0f})")
+        if greeks["daily_theta"] < -50:
+            warnings.append(f"⚠️ High theta decay (${greeks['daily_theta']:.0f}/day)")
+
+        if warnings:
+            msg += "*Warnings:*\n"
+            for w in warnings:
+                msg += f"{w}\n"
+            msg += "\n"
+
+        # Sector concentration
+        if concentration["sectors"]:
+            msg += "*Sector Allocation:*\n"
+            for sector, pct in sorted(concentration["sectors"].items(), key=lambda x: -x[1]):
+                if pct >= 5:  # Only show sectors >= 5%
+                    bar_len = int(pct / 10)
+                    bar = "█" * bar_len
+                    msg += f"├── {sector}: {pct:.0f}% {bar}\n"
+
+            if concentration["concentrated"]:
+                msg += f"\n⚠️ *Concentrated:* {concentration['warning']}\n"
+
+        # Per-position Greeks
+        msg += "\n*By Position:*\n"
+        for p in greeks["positions"]:
+            msg += f"\n*{p['symbol']}* {p['option_type'].upper()} ${p['strike']}\n"
+            msg += f"   Δ:{p['delta']:+.0f} Θ:${p['theta']:+.2f} IV:{p['iv']:.0f}%\n"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Greeks error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+@admin_only
+async def cmd_flowperf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show flow signal factor performance"""
+    try:
+        from db import get_signal_factor_performance, get_score_tier_performance
+
+        factors = get_signal_factor_performance()
+        tiers = get_score_tier_performance()
+
+        msg = "📈 *Flow Signal Performance*\n\n"
+
+        # Score tier performance
+        if tiers:
+            msg += "*By Score Tier:*\n"
+            for t in tiers:
+                emoji = "🟢" if t["win_rate"] >= 50 else "🔴"
+                msg += f"{emoji} {t['tier']}: {t['win_rate']:.0f}% win ({t['total']} trades)\n"
+                msg += f"   Avg P/L: {t['avg_pnl']:+.1f}% | Hold: {t['avg_holding_days']:.0f}d\n"
+            msg += "\n"
+
+        # Factor analysis
+        if factors:
+            msg += "*By Signal Factor:*\n"
+
+            factor_labels = {
+                "was_sweep": "Sweep",
+                "was_ask_side": "Ask Side",
+                "was_floor": "Floor Trade",
+                "was_opening": "Opening",
+            }
+
+            for factor, results in factors.items():
+                if factor in factor_labels and results:
+                    label = factor_labels[factor]
+                    # Find the "present=True" result
+                    present = next((r for r in results if r.get("present")), None)
+                    absent = next((r for r in results if not r.get("present")), None)
+
+                    if present and present["total"] >= 3:
+                        emoji = "🟢" if present["win_rate"] >= 50 else "🔴"
+                        comparison = ""
+                        if absent and absent["total"] >= 3:
+                            diff = present["win_rate"] - absent["win_rate"]
+                            if abs(diff) >= 5:
+                                comparison = f" ({diff:+.0f}% vs without)"
+                        msg += f"{emoji} {label}: {present['win_rate']:.0f}% win{comparison}\n"
+
+            # Premium tier
+            if "premium_tier" in factors and factors["premium_tier"]:
+                msg += "\n*By Premium:*\n"
+                for tier in factors["premium_tier"]:
+                    if tier["total"] >= 2:
+                        emoji = "🟢" if tier["win_rate"] >= 50 else "🔴"
+                        msg += f"{emoji} {tier['tier']}: {tier['win_rate']:.0f}% ({tier['total']} trades)\n"
+
+        if not tiers and not factors:
+            msg += "No signal outcomes recorded yet.\n"
+            msg += "Performance data will appear after closing trades."
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Flow perf error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+@admin_only
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle natural language messages"""
     text = update.message.text.lower()
@@ -1229,6 +1408,9 @@ def main():
     app.add_handler(CommandHandler("flow", cmd_flow))
     app.add_handler(CommandHandler("analyze", cmd_analyze))
     app.add_handler(CommandHandler("options", cmd_options))
+    app.add_handler(CommandHandler("greeks", cmd_greeks))
+    app.add_handler(CommandHandler("expirations", cmd_expirations))
+    app.add_handler(CommandHandler("flowperf", cmd_flowperf))
     app.add_handler(CommandHandler("buyoption", cmd_buyoption))
     app.add_handler(CommandHandler("closeoption", cmd_closeoption))
     app.add_handler(CommandHandler("reconcile", cmd_reconcile))

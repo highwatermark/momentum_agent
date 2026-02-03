@@ -2,9 +2,10 @@
 Options Executor - Place and manage options orders via Alpaca
 """
 import json
+import math
 from datetime import datetime, timedelta
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -48,6 +49,74 @@ class OptionsPosition:
     market_value: float
     unrealized_pl: float
     unrealized_plpc: float
+
+
+@dataclass
+class PositionGreeks:
+    """Greeks for a single position"""
+    delta: float
+    gamma: float
+    theta: float  # Daily decay in $
+    vega: float
+    iv: float = 0.0  # Implied volatility
+
+    def scale(self, quantity: int) -> 'PositionGreeks':
+        """Scale Greeks by position size (100 shares per contract)"""
+        return PositionGreeks(
+            delta=self.delta * quantity * 100,  # Per 100 shares
+            gamma=self.gamma * quantity * 100,
+            theta=self.theta * quantity * 100,
+            vega=self.vega * quantity * 100,
+            iv=self.iv,
+        )
+
+    def to_dict(self) -> Dict:
+        """Convert to dictionary for logging"""
+        return {
+            "delta": round(self.delta, 4),
+            "gamma": round(self.gamma, 6),
+            "theta": round(self.theta, 4),
+            "vega": round(self.vega, 4),
+            "iv": round(self.iv, 4),
+        }
+
+
+# Sector mapping for concentration checks
+SECTOR_MAP = {
+    # Tech
+    "AAPL": "tech", "MSFT": "tech", "GOOGL": "tech", "GOOG": "tech", "META": "tech",
+    "NVDA": "tech", "AMD": "tech", "INTC": "tech", "CRM": "tech", "ORCL": "tech",
+    "ADBE": "tech", "NOW": "tech", "SNOW": "tech", "PLTR": "tech", "NET": "tech",
+    "AVGO": "tech", "QCOM": "tech", "MU": "tech", "TSM": "tech", "ASML": "tech",
+
+    # Finance
+    "JPM": "finance", "BAC": "finance", "WFC": "finance", "GS": "finance", "MS": "finance",
+    "C": "finance", "BLK": "finance", "SCHW": "finance", "V": "finance", "MA": "finance",
+    "AXP": "finance", "COF": "finance", "USB": "finance", "PNC": "finance",
+
+    # Healthcare
+    "UNH": "healthcare", "JNJ": "healthcare", "PFE": "healthcare", "ABBV": "healthcare",
+    "MRK": "healthcare", "LLY": "healthcare", "TMO": "healthcare", "ABT": "healthcare",
+    "BMY": "healthcare", "AMGN": "healthcare", "GILD": "healthcare", "MRNA": "healthcare",
+
+    # Energy
+    "XOM": "energy", "CVX": "energy", "COP": "energy", "SLB": "energy", "EOG": "energy",
+    "OXY": "energy", "MPC": "energy", "VLO": "energy", "PSX": "energy",
+
+    # Consumer
+    "AMZN": "consumer", "TSLA": "consumer", "HD": "consumer", "NKE": "consumer",
+    "MCD": "consumer", "SBUX": "consumer", "TGT": "consumer", "WMT": "consumer",
+    "COST": "consumer", "LOW": "consumer", "TJX": "consumer", "BKNG": "consumer",
+
+    # Industrial
+    "CAT": "industrial", "DE": "industrial", "BA": "industrial", "HON": "industrial",
+    "UPS": "industrial", "RTX": "industrial", "LMT": "industrial", "GE": "industrial",
+    "MMM": "industrial", "UNP": "industrial", "FDX": "industrial",
+
+    # ETFs
+    "SPY": "index", "QQQ": "index", "IWM": "index", "DIA": "index",
+    "XLF": "finance_etf", "XLK": "tech_etf", "XLE": "energy_etf", "XLV": "healthcare_etf",
+}
 
 
 def get_trading_client() -> TradingClient:
@@ -272,6 +341,430 @@ def reconcile_options_positions() -> Dict:
         "actual_count": len(actual_positions),
         "db_count": len(db_trades),
     }
+
+
+# ============== GREEKS CALCULATIONS ==============
+
+def estimate_greeks(
+    option_type: str,
+    underlying_price: float,
+    strike: float,
+    days_to_exp: int,
+    iv: float,
+    risk_free_rate: float = 0.05,
+) -> PositionGreeks:
+    """
+    Estimate option Greeks using Black-Scholes approximation.
+
+    Args:
+        option_type: 'call' or 'put'
+        underlying_price: Current price of underlying
+        strike: Strike price
+        days_to_exp: Days to expiration
+        iv: Implied volatility (as decimal, e.g., 0.30 for 30%)
+        risk_free_rate: Risk-free interest rate (default 5%)
+
+    Returns:
+        PositionGreeks with delta, gamma, theta, vega
+    """
+    if days_to_exp <= 0:
+        return PositionGreeks(delta=0, gamma=0, theta=0, vega=0, iv=iv)
+
+    T = days_to_exp / 365
+    S = underlying_price
+    K = strike
+    r = risk_free_rate
+    sigma = iv if iv > 0 else 0.30  # Default to 30% IV
+
+    try:
+        d1 = (math.log(S / K) + (r + sigma ** 2 / 2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+
+        # Normal CDF approximation
+        def norm_cdf(x):
+            return (1 + math.erf(x / math.sqrt(2))) / 2
+
+        def norm_pdf(x):
+            return math.exp(-x ** 2 / 2) / math.sqrt(2 * math.pi)
+
+        if option_type.lower() == "call":
+            delta = norm_cdf(d1)
+        else:
+            delta = norm_cdf(d1) - 1
+
+        gamma = norm_pdf(d1) / (S * sigma * math.sqrt(T))
+        theta = -(S * norm_pdf(d1) * sigma) / (2 * math.sqrt(T)) / 365  # Per day
+        vega = S * norm_pdf(d1) * math.sqrt(T) / 100  # Per 1% IV change
+
+        return PositionGreeks(
+            delta=round(delta, 4),
+            gamma=round(gamma, 6),
+            theta=round(theta, 4),
+            vega=round(vega, 4),
+            iv=round(sigma, 4),
+        )
+    except Exception as e:
+        print(f"Greeks calculation error: {e}")
+        return PositionGreeks(delta=0, gamma=0, theta=0, vega=0, iv=iv)
+
+
+def get_option_greeks(contract_symbol: str, underlying_price: float = None) -> PositionGreeks:
+    """
+    Get Greeks for a specific option contract.
+
+    Args:
+        contract_symbol: OCC contract symbol
+        underlying_price: Optional underlying price (will fetch if not provided)
+
+    Returns:
+        PositionGreeks
+    """
+    # Parse contract to get details
+    contract_info = parse_contract_symbol(contract_symbol)
+
+    if not contract_info.get('expiration'):
+        return PositionGreeks(delta=0, gamma=0, theta=0, vega=0)
+
+    # Calculate DTE
+    try:
+        exp_date = datetime.strptime(contract_info['expiration'], "%Y-%m-%d")
+        dte = max(1, (exp_date - datetime.now()).days)
+    except Exception:
+        dte = 30  # Default
+
+    # Get underlying price if not provided
+    if underlying_price is None:
+        try:
+            from alpaca.data.historical.stock import StockHistoricalDataClient
+            from alpaca.data.requests import StockLatestQuoteRequest
+
+            client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+            request = StockLatestQuoteRequest(symbol_or_symbols=[contract_info['underlying']])
+            quotes = client.get_stock_latest_quote(request)
+
+            if contract_info['underlying'] in quotes:
+                quote = quotes[contract_info['underlying']]
+                underlying_price = (float(quote.bid_price) + float(quote.ask_price)) / 2
+        except Exception as e:
+            print(f"Error fetching underlying price: {e}")
+            underlying_price = contract_info.get('strike', 100)  # Fallback
+
+    # Estimate IV from option price (simplified)
+    option_quote = get_option_quote(contract_symbol)
+    option_mid = option_quote.get('mid', 0)
+
+    # Simple IV approximation: higher option price relative to underlying = higher IV
+    # This is a rough estimate; real systems would use Newton-Raphson to solve for IV
+    moneyness = underlying_price / contract_info.get('strike', underlying_price) if contract_info.get('strike') else 1
+    base_iv = 0.30  # 30% base
+
+    if option_mid > 0 and underlying_price > 0:
+        # Rough IV estimate based on option price
+        price_ratio = option_mid / underlying_price
+        estimated_iv = base_iv * (1 + price_ratio * 10)  # Scale up based on option price
+        estimated_iv = min(max(estimated_iv, 0.10), 2.0)  # Cap between 10% and 200%
+    else:
+        estimated_iv = base_iv
+
+    return estimate_greeks(
+        option_type=contract_info.get('option_type', 'call'),
+        underlying_price=underlying_price,
+        strike=contract_info.get('strike', underlying_price),
+        days_to_exp=dte,
+        iv=estimated_iv,
+    )
+
+
+def get_portfolio_greeks() -> Dict:
+    """
+    Calculate aggregate Greeks across all options positions.
+
+    Returns:
+        Dict with net_delta, total_gamma, daily_theta, total_vega, and per-position Greeks
+    """
+    positions = get_options_positions()
+
+    if not positions:
+        return {
+            "net_delta": 0,
+            "total_gamma": 0,
+            "daily_theta": 0,
+            "total_vega": 0,
+            "positions": [],
+        }
+
+    position_greeks = []
+    totals = {"delta": 0, "gamma": 0, "theta": 0, "vega": 0}
+
+    for pos in positions:
+        try:
+            # Get Greeks for this position
+            greeks = get_option_greeks(pos.contract_symbol, pos.current_price)
+
+            # Scale by quantity
+            scaled = greeks.scale(pos.quantity)
+
+            position_greeks.append({
+                "symbol": pos.symbol,
+                "contract": pos.contract_symbol,
+                "quantity": pos.quantity,
+                "option_type": pos.option_type,
+                "strike": pos.strike,
+                "expiration": pos.expiration,
+                "delta": round(scaled.delta, 1),
+                "gamma": round(scaled.gamma, 4),
+                "theta": round(scaled.theta, 2),
+                "vega": round(scaled.vega, 2),
+                "iv": round(greeks.iv * 100, 1),  # As percentage
+            })
+
+            totals["delta"] += scaled.delta
+            totals["gamma"] += scaled.gamma
+            totals["theta"] += scaled.theta
+            totals["vega"] += scaled.vega
+
+        except Exception as e:
+            print(f"Error calculating Greeks for {pos.symbol}: {e}")
+
+    return {
+        "net_delta": round(totals["delta"], 1),
+        "total_gamma": round(totals["gamma"], 2),
+        "daily_theta": round(totals["theta"], 2),  # Daily $ decay
+        "total_vega": round(totals["vega"], 2),
+        "positions": position_greeks,
+    }
+
+
+# ============== SECTOR CONCENTRATION ==============
+
+def get_sector(symbol: str) -> str:
+    """Get sector for a symbol"""
+    return SECTOR_MAP.get(symbol.upper(), "other")
+
+
+def check_sector_concentration() -> Dict:
+    """
+    Check sector concentration across options positions.
+
+    Returns:
+        Dict with concentration analysis
+    """
+    positions = get_options_positions()
+
+    if not positions:
+        return {"concentrated": False, "sectors": {}}
+
+    sector_values = {}
+    total_value = 0
+
+    for pos in positions:
+        sector = get_sector(pos.symbol)
+        value = abs(pos.market_value)
+        sector_values[sector] = sector_values.get(sector, 0) + value
+        total_value += value
+
+    # Calculate percentages
+    sector_pcts = {
+        sector: (value / total_value * 100) if total_value > 0 else 0
+        for sector, value in sector_values.items()
+    }
+
+    # Check if any sector > 50%
+    max_sector = max(sector_pcts.items(), key=lambda x: x[1]) if sector_pcts else ("none", 0)
+    concentrated = max_sector[1] > OPTIONS_SAFETY.get("max_single_sector_pct", 50.0)
+
+    return {
+        "concentrated": concentrated,
+        "max_sector": max_sector[0],
+        "max_sector_pct": round(max_sector[1], 1),
+        "sectors": {k: round(v, 1) for k, v in sector_pcts.items()},
+        "warning": f"{max_sector[1]:.0f}% in {max_sector[0]}" if concentrated else None,
+    }
+
+
+def can_add_position(symbol: str, estimated_value: float = None) -> Tuple[bool, str]:
+    """
+    Check if adding a position would violate concentration limits.
+
+    Args:
+        symbol: Symbol to add
+        estimated_value: Estimated position value (optional)
+
+    Returns:
+        (can_add: bool, reason: str)
+    """
+    sector = get_sector(symbol)
+    concentration = check_sector_concentration()
+    positions = get_options_positions()
+
+    max_sector_pct = OPTIONS_SAFETY.get("max_single_sector_pct", 50.0)
+    max_underlying_pct = OPTIONS_SAFETY.get("max_single_underlying_pct", 30.0)
+
+    current_sector_pct = concentration["sectors"].get(sector, 0)
+
+    # Check if adding would exceed sector limit (rough estimate: assume adds 15-25%)
+    if current_sector_pct > max_sector_pct * 0.8:  # Already at 80% of limit
+        return False, f"Sector {sector} already at {current_sector_pct:.0f}% (limit {max_sector_pct:.0f}%)"
+
+    # Check if already have position in this underlying
+    for pos in positions:
+        if pos.symbol == symbol:
+            return False, f"Already have position in {symbol}"
+
+    # Check underlying concentration
+    total_value = sum(abs(p.market_value) for p in positions)
+    underlying_value = sum(abs(p.market_value) for p in positions if p.symbol == symbol)
+    underlying_pct = (underlying_value / total_value * 100) if total_value > 0 else 0
+
+    if underlying_pct > max_underlying_pct:
+        return False, f"Would exceed {max_underlying_pct:.0f}% in {symbol} (currently {underlying_pct:.0f}%)"
+
+    return True, "OK"
+
+
+# ============== DTE ALERTS & ROLL SUGGESTIONS ==============
+
+def check_expiration_risk() -> List[Dict]:
+    """
+    Check positions approaching expiration.
+
+    Returns:
+        List of positions needing attention with suggested actions
+    """
+    positions = get_options_positions()
+    alerts = []
+
+    roll_alert_dte = OPTIONS_SAFETY.get("roll_alert_dte", 7)
+    critical_dte = OPTIONS_SAFETY.get("critical_dte", 3)
+
+    for pos in positions:
+        try:
+            exp_date = datetime.strptime(pos.expiration, "%Y-%m-%d")
+            dte = (exp_date - datetime.now()).days
+
+            alert = None
+
+            if dte <= 0:
+                alert = {
+                    "position": pos,
+                    "dte": dte,
+                    "severity": "CRITICAL",
+                    "message": "EXPIRED - Close immediately",
+                    "action": "close",
+                }
+            elif dte <= critical_dte:
+                alert = {
+                    "position": pos,
+                    "dte": dte,
+                    "severity": "HIGH",
+                    "message": f"Expiring in {dte} days - Consider closing or rolling",
+                    "action": "close_or_roll",
+                }
+            elif dte <= roll_alert_dte:
+                alert = {
+                    "position": pos,
+                    "dte": dte,
+                    "severity": "MEDIUM",
+                    "message": f"{dte} DTE - Monitor theta decay",
+                    "action": "monitor",
+                }
+
+            # Check if ITM (assignment risk for American options)
+            if alert:
+                if pos.option_type == "call" and pos.current_price > pos.strike:
+                    alert["message"] += " | ITM - Assignment risk"
+                    alert["itm"] = True
+                elif pos.option_type == "put" and pos.current_price < pos.strike:
+                    alert["message"] += " | ITM - Assignment risk"
+                    alert["itm"] = True
+
+            if alert:
+                alerts.append(alert)
+
+        except Exception as e:
+            print(f"Error checking expiration for {pos.contract_symbol}: {e}")
+
+    return sorted(alerts, key=lambda x: x["dte"])
+
+
+def suggest_roll(position: OptionsPosition) -> Dict:
+    """
+    Suggest a roll for an expiring position.
+
+    Args:
+        position: The expiring position
+
+    Returns:
+        Roll suggestion with new contract and cost
+    """
+    # Find same strike, later expiration
+    new_exp_min = 21  # At least 3 weeks out
+    new_exp_max = 45  # Not too far
+
+    new_contract = find_option_contract(
+        underlying=position.symbol,
+        option_type=position.option_type,
+        target_strike=position.strike,
+        min_dte=new_exp_min,
+        max_dte=new_exp_max,
+    )
+
+    if not new_contract:
+        return {"can_roll": False, "reason": "No suitable contract found"}
+
+    # Get quotes for both
+    old_quote = get_option_quote(position.contract_symbol)
+    new_quote = get_option_quote(new_contract["symbol"])
+
+    roll_cost = new_quote["mid"] - old_quote["mid"]
+
+    return {
+        "can_roll": True,
+        "current_contract": position.contract_symbol,
+        "new_contract": new_contract["symbol"],
+        "new_expiration": new_contract["expiration"],
+        "new_dte": new_contract.get("dte", 30),
+        "roll_cost": round(roll_cost, 2),  # Positive = debit, Negative = credit
+        "current_value": round(old_quote["mid"], 2),
+        "new_value": round(new_quote["mid"], 2),
+    }
+
+
+# ============== EARNINGS BLACKOUT ==============
+
+def check_earnings_blackout(symbol: str, blackout_days: int = None) -> Tuple[bool, Optional[str]]:
+    """
+    Check if symbol is in earnings blackout period.
+
+    Args:
+        symbol: Stock symbol
+        blackout_days: Days before earnings to block (default from config)
+
+    Returns:
+        (is_blocked, earnings_date or None)
+    """
+    blackout_days = blackout_days or OPTIONS_SAFETY.get("earnings_blackout_days", 2)
+
+    try:
+        from flow_scanner import UnusualWhalesClient
+
+        client = UnusualWhalesClient()
+        earnings = client.get_earnings(symbol)
+
+        if not earnings or not earnings.get("next_earnings_date"):
+            return False, None
+
+        earnings_date_str = earnings["next_earnings_date"][:10]
+        earnings_date = datetime.strptime(earnings_date_str, "%Y-%m-%d")
+        days_to_earnings = (earnings_date - datetime.now()).days
+
+        if 0 <= days_to_earnings <= blackout_days:
+            return True, earnings_date_str
+
+    except Exception as e:
+        print(f"Error checking earnings for {symbol}: {e}")
+
+    return False, None
 
 
 def get_options_positions() -> List[OptionsPosition]:
@@ -604,6 +1097,24 @@ def execute_flow_trade(enriched_signal) -> Dict:
             "error": f"Recommendation is {enriched_signal.recommendation}, not BUY"
         }
 
+    # Check earnings blackout
+    blocked, earnings_date = check_earnings_blackout(signal.symbol)
+    if blocked:
+        return {
+            "success": False,
+            "error": f"Earnings blackout: {signal.symbol} reports on {earnings_date}",
+            "symbol": signal.symbol,
+        }
+
+    # Check sector concentration
+    can_add, concentration_reason = can_add_position(signal.symbol)
+    if not can_add:
+        return {
+            "success": False,
+            "error": f"Concentration limit: {concentration_reason}",
+            "symbol": signal.symbol,
+        }
+
     # Check position limits
     current_positions = get_options_positions()
     if len(current_positions) >= OPTIONS_CONFIG["max_options_positions"]:
@@ -612,7 +1123,7 @@ def execute_flow_trade(enriched_signal) -> Dict:
             "error": f"Max options positions ({OPTIONS_CONFIG['max_options_positions']}) reached"
         }
 
-    # Check if already have position in this underlying
+    # Check if already have position in this underlying (redundant with can_add_position but explicit)
     for pos in current_positions:
         if pos.symbol == signal.symbol:
             return {
@@ -692,7 +1203,34 @@ def execute_flow_trade(enriched_signal) -> Dict:
     if not order_result.get("success"):
         return order_result
 
-    # Log to database
+    # Get Greeks at entry for logging
+    entry_greeks = None
+    underlying_price = None
+    dte = None
+    try:
+        # Get underlying price
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestQuoteRequest
+
+        stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        quote_request = StockLatestQuoteRequest(symbol_or_symbols=[signal.symbol])
+        quotes = stock_client.get_stock_latest_quote(quote_request)
+        if signal.symbol in quotes:
+            q = quotes[signal.symbol]
+            underlying_price = (float(q.bid_price) + float(q.ask_price)) / 2
+
+        # Calculate DTE
+        exp_date = datetime.strptime(contract['expiration'], "%Y-%m-%d")
+        dte = max(1, (exp_date - datetime.now()).days)
+
+        # Get Greeks
+        greeks = get_option_greeks(contract['symbol'], underlying_price)
+        entry_greeks = greeks.to_dict()
+        print(f"  Entry Greeks: Delta={entry_greeks['delta']:.3f}, Theta={entry_greeks['theta']:.3f}, IV={entry_greeks['iv']*100:.1f}%")
+    except Exception as e:
+        print(f"  Warning: Could not calculate entry Greeks: {e}")
+
+    # Log to database with Greeks
     try:
         trade_id = log_options_trade(
             contract_symbol=contract['symbol'],
@@ -712,7 +1250,10 @@ def execute_flow_trade(enriched_signal) -> Dict:
                 'score_breakdown': signal.score_breakdown
             }),
             thesis=enriched_signal.thesis,
-            flow_signal_id=None  # Would need signal ID from DB if logged
+            flow_signal_id=getattr(signal, 'db_id', None),
+            entry_greeks=entry_greeks,
+            underlying_price=underlying_price,
+            dte=dte,
         )
 
         # Mark signal as executed if we have the ID
@@ -735,7 +1276,8 @@ def execute_flow_trade(enriched_signal) -> Dict:
         "fill_price": order_result.get('fill_price'),
         "estimated_cost": quantity * estimated_price * 100,
         "order_id": order_result.get('order_id'),
-        "thesis": enriched_signal.thesis[:200] if enriched_signal.thesis else None
+        "thesis": enriched_signal.thesis[:200] if enriched_signal.thesis else None,
+        "entry_greeks": entry_greeks,
     }
 
 
@@ -745,7 +1287,7 @@ def close_options_position(
     quantity: int = None
 ) -> Dict:
     """
-    Close an options position.
+    Close an options position with Greeks logging.
 
     Args:
         contract_symbol: Full OCC contract symbol
@@ -775,6 +1317,36 @@ def close_options_position(
         entry_price = float(position.avg_entry_price)
         current_price = float(position.current_price)
 
+        # Get exit Greeks before closing
+        exit_greeks = None
+        underlying_price = None
+        dte = None
+        try:
+            contract_info = parse_contract_symbol(contract_symbol)
+
+            # Get underlying price
+            from alpaca.data.historical.stock import StockHistoricalDataClient
+            from alpaca.data.requests import StockLatestQuoteRequest
+
+            stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+            quote_request = StockLatestQuoteRequest(symbol_or_symbols=[contract_info['underlying']])
+            quotes = stock_client.get_stock_latest_quote(quote_request)
+            if contract_info['underlying'] in quotes:
+                q = quotes[contract_info['underlying']]
+                underlying_price = (float(q.bid_price) + float(q.ask_price)) / 2
+
+            # Calculate DTE
+            if contract_info.get('expiration'):
+                exp_date = datetime.strptime(contract_info['expiration'], "%Y-%m-%d")
+                dte = max(0, (exp_date - datetime.now()).days)
+
+            # Get Greeks
+            greeks = get_option_greeks(contract_symbol, underlying_price)
+            exit_greeks = greeks.to_dict()
+            print(f"  Exit Greeks: Delta={exit_greeks['delta']:.3f}, Theta={exit_greeks['theta']:.3f}, IV={exit_greeks['iv']*100:.1f}%")
+        except Exception as e:
+            print(f"  Warning: Could not calculate exit Greeks: {e}")
+
         # Cancel any open orders for this contract
         orders = client.get_orders(GetOrdersRequest(
             status=QueryOrderStatus.OPEN,
@@ -803,15 +1375,62 @@ def close_options_position(
         pnl = (exit_price - entry_price) * qty * 100
         pnl_pct = ((exit_price - entry_price) / entry_price) if entry_price > 0 else 0
 
-        # Update database
+        # Update database with exit Greeks
         try:
             trade = get_options_trade_by_contract(contract_symbol, status='open')
             if trade:
                 update_options_trade_exit(
                     trade_id=trade['id'],
                     exit_price=exit_price,
-                    exit_reason=reason
+                    exit_reason=reason,
+                    exit_greeks=exit_greeks,
+                    underlying_price=underlying_price,
+                    dte=dte,
                 )
+
+                # Log signal outcome for learning if we have signal data
+                try:
+                    from db import log_signal_outcome, get_options_trade_with_greeks
+
+                    full_trade = get_options_trade_with_greeks(trade['id'])
+                    if full_trade and full_trade.get('signal_data'):
+                        import json
+                        signal_factors = json.loads(full_trade['signal_data'])
+                        signal_factors['option_type'] = full_trade.get('option_type')
+                        signal_factors['dte'] = full_trade.get('entry_dte', 0)
+
+                        # Calculate holding days
+                        holding_days = 0
+                        if full_trade.get('entry_date'):
+                            entry_dt = datetime.fromisoformat(full_trade['entry_date'][:10])
+                            holding_days = (datetime.now() - entry_dt).days
+
+                        log_signal_outcome(
+                            signal_id=full_trade.get('flow_signal_id'),
+                            trade_id=trade['id'],
+                            symbol=full_trade.get('underlying'),
+                            signal_score=full_trade.get('signal_score'),
+                            signal_factors=signal_factors,
+                            entry_greeks={
+                                'delta': full_trade.get('entry_delta'),
+                                'theta': full_trade.get('entry_theta'),
+                                'iv': full_trade.get('entry_iv'),
+                            },
+                            outcome={
+                                'entry_price': full_trade.get('entry_price'),
+                                'exit_price': exit_price,
+                                'max_price': exit_price,  # Would need tracking during hold
+                                'min_price': exit_price,  # Would need tracking during hold
+                                'max_gain_pct': max(pnl_pct * 100, 0),
+                                'max_loss_pct': min(pnl_pct * 100, 0),
+                                'actual_pnl_pct': pnl_pct * 100,
+                                'holding_days': holding_days,
+                                'exit_reason': reason,
+                            }
+                        )
+                except Exception as e:
+                    print(f"  Warning: Could not log signal outcome: {e}")
+
         except Exception as e:
             print(f"  Warning: Could not update trade record: {e}")
 
@@ -823,7 +1442,8 @@ def close_options_position(
             "pnl": pnl,
             "pnl_pct": pnl_pct,
             "reason": reason,
-            "order_id": order_result.get('order_id')
+            "order_id": order_result.get('order_id'),
+            "exit_greeks": exit_greeks,
         }
 
     except Exception as e:

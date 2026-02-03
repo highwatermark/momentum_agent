@@ -64,6 +64,39 @@ def migrate_tables(conn: sqlite3.Connection):
                 if "duplicate column" not in str(e).lower():
                     print(f"Error adding column {col_name}: {e}")
 
+    # Migrate options_trades table for Greeks columns
+    cursor.execute("PRAGMA table_info(options_trades)")
+    options_columns = {row[1] for row in cursor.fetchall()}
+
+    options_new_columns = [
+        ("entry_delta", "REAL"),
+        ("entry_gamma", "REAL"),
+        ("entry_theta", "REAL"),
+        ("entry_vega", "REAL"),
+        ("entry_iv", "REAL"),
+        ("entry_underlying_price", "REAL"),
+        ("entry_dte", "INTEGER"),
+        ("exit_delta", "REAL"),
+        ("exit_gamma", "REAL"),
+        ("exit_theta", "REAL"),
+        ("exit_vega", "REAL"),
+        ("exit_iv", "REAL"),
+        ("exit_underlying_price", "REAL"),
+        ("exit_dte", "INTEGER"),
+        ("max_delta", "REAL"),
+        ("min_delta", "REAL"),
+        ("max_theta_paid", "REAL"),
+    ]
+
+    for col_name, col_type in options_new_columns:
+        if col_name not in options_columns:
+            try:
+                cursor.execute(f"ALTER TABLE options_trades ADD COLUMN {col_name} {col_type}")
+                print(f"Added column {col_name} to options_trades table")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    print(f"Error adding column {col_name}: {e}")
+
     conn.commit()
 
 
@@ -424,7 +457,7 @@ def init_tables(conn: sqlite3.Connection):
         )
     """)
 
-    # Options trades table
+    # Options trades table with Greeks tracking
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS options_trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -446,6 +479,30 @@ def init_tables(conn: sqlite3.Connection):
             pnl_pct REAL,
             status TEXT DEFAULT 'open',
             flow_signal_id INTEGER,
+
+            -- Greeks at entry
+            entry_delta REAL,
+            entry_gamma REAL,
+            entry_theta REAL,
+            entry_vega REAL,
+            entry_iv REAL,
+            entry_underlying_price REAL,
+            entry_dte INTEGER,
+
+            -- Greeks at exit
+            exit_delta REAL,
+            exit_gamma REAL,
+            exit_theta REAL,
+            exit_vega REAL,
+            exit_iv REAL,
+            exit_underlying_price REAL,
+            exit_dte INTEGER,
+
+            -- Max/min Greeks during hold
+            max_delta REAL,
+            min_delta REAL,
+            max_theta_paid REAL,
+
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (flow_signal_id) REFERENCES flow_signals(id)
         )
@@ -465,6 +522,57 @@ def init_tables(conn: sqlite3.Connection):
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Flow signal outcomes table for learning loop
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS flow_signal_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id INTEGER,
+            trade_id INTEGER,
+            symbol TEXT,
+            signal_score INTEGER,
+
+            -- Signal characteristics for factor analysis
+            was_sweep INTEGER,
+            was_ask_side INTEGER,
+            was_floor INTEGER,
+            was_opening INTEGER,
+            premium_tier TEXT,
+            vol_oi_tier TEXT,
+            option_type TEXT,
+            dte_at_entry INTEGER,
+
+            -- Greeks at entry
+            entry_delta REAL,
+            entry_theta REAL,
+            entry_iv REAL,
+
+            -- Outcome tracking
+            entry_price REAL,
+            max_price REAL,
+            min_price REAL,
+            exit_price REAL,
+            max_gain_pct REAL,
+            max_loss_pct REAL,
+            actual_pnl_pct REAL,
+            holding_days INTEGER,
+            exit_reason TEXT,
+
+            -- Win/loss flags for analysis
+            was_winner INTEGER,
+            hit_target INTEGER,
+            hit_stop INTEGER,
+
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (signal_id) REFERENCES flow_signals(id),
+            FOREIGN KEY (trade_id) REFERENCES options_trades(id)
+        )
+    """)
+
+    # Indexes for signal outcome analysis
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_score ON flow_signal_outcomes(signal_score)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_winner ON flow_signal_outcomes(was_winner)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_symbol ON flow_signal_outcomes(symbol)")
 
     conn.commit()
 
@@ -2130,18 +2238,48 @@ def log_options_trade(
     signal_score: int = None,
     signal_data: dict = None,
     thesis: str = None,
-    flow_signal_id: int = None
+    flow_signal_id: int = None,
+    entry_greeks: dict = None,
+    underlying_price: float = None,
+    dte: int = None,
 ) -> int:
-    """Log an options trade"""
+    """
+    Log an options trade with Greeks.
+
+    Args:
+        contract_symbol: OCC contract symbol
+        underlying: Underlying stock symbol
+        option_type: 'call' or 'put'
+        strike: Strike price
+        expiration: Expiration date
+        quantity: Number of contracts
+        entry_price: Entry option price
+        signal_score: Flow signal score
+        signal_data: Additional signal data (JSON)
+        thesis: Trading thesis
+        flow_signal_id: Reference to flow_signals table
+        entry_greeks: Dict with delta, gamma, theta, vega, iv
+        underlying_price: Price of underlying at entry
+        dte: Days to expiration at entry
+    """
     conn = get_connection()
     cursor = conn.cursor()
+
+    # Extract Greeks if provided
+    entry_delta = entry_greeks.get('delta') if entry_greeks else None
+    entry_gamma = entry_greeks.get('gamma') if entry_greeks else None
+    entry_theta = entry_greeks.get('theta') if entry_greeks else None
+    entry_vega = entry_greeks.get('vega') if entry_greeks else None
+    entry_iv = entry_greeks.get('iv') if entry_greeks else None
 
     cursor.execute("""
         INSERT INTO options_trades (
             contract_symbol, underlying, option_type, strike, expiration,
             entry_date, entry_price, quantity, signal_score, signal_data,
-            thesis, status, flow_signal_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+            thesis, status, flow_signal_id,
+            entry_delta, entry_gamma, entry_theta, entry_vega, entry_iv,
+            entry_underlying_price, entry_dte
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         contract_symbol,
         underlying,
@@ -2155,6 +2293,13 @@ def log_options_trade(
         json.dumps(signal_data) if signal_data else None,
         thesis,
         flow_signal_id,
+        entry_delta,
+        entry_gamma,
+        entry_theta,
+        entry_vega,
+        entry_iv,
+        underlying_price,
+        dte,
     ))
 
     trade_id = cursor.lastrowid
@@ -2163,8 +2308,25 @@ def log_options_trade(
     return trade_id
 
 
-def update_options_trade_exit(trade_id: int, exit_price: float, exit_reason: str):
-    """Update options trade with exit info"""
+def update_options_trade_exit(
+    trade_id: int,
+    exit_price: float,
+    exit_reason: str,
+    exit_greeks: dict = None,
+    underlying_price: float = None,
+    dte: int = None,
+):
+    """
+    Update options trade with exit info and Greeks.
+
+    Args:
+        trade_id: ID of the trade to update
+        exit_price: Exit option price
+        exit_reason: Reason for exit
+        exit_greeks: Dict with delta, gamma, theta, vega, iv at exit
+        underlying_price: Price of underlying at exit
+        dte: Days to expiration at exit
+    """
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -2179,10 +2341,19 @@ def update_options_trade_exit(trade_id: int, exit_price: float, exit_reason: str
         pnl_amount = (exit_price - entry_price) * quantity * 100
         pnl_pct = ((exit_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
 
+        # Extract exit Greeks if provided
+        exit_delta = exit_greeks.get('delta') if exit_greeks else None
+        exit_gamma = exit_greeks.get('gamma') if exit_greeks else None
+        exit_theta = exit_greeks.get('theta') if exit_greeks else None
+        exit_vega = exit_greeks.get('vega') if exit_greeks else None
+        exit_iv = exit_greeks.get('iv') if exit_greeks else None
+
         cursor.execute("""
             UPDATE options_trades
             SET exit_date = ?, exit_price = ?, exit_reason = ?,
-                pnl_amount = ?, pnl_pct = ?, status = 'closed'
+                pnl_amount = ?, pnl_pct = ?, status = 'closed',
+                exit_delta = ?, exit_gamma = ?, exit_theta = ?, exit_vega = ?, exit_iv = ?,
+                exit_underlying_price = ?, exit_dte = ?
             WHERE id = ?
         """, (
             datetime.now().isoformat(),
@@ -2190,6 +2361,13 @@ def update_options_trade_exit(trade_id: int, exit_price: float, exit_reason: str
             exit_reason,
             pnl_amount,
             pnl_pct,
+            exit_delta,
+            exit_gamma,
+            exit_theta,
+            exit_vega,
+            exit_iv,
+            underlying_price,
+            dte,
             trade_id,
         ))
 
@@ -2327,6 +2505,255 @@ def log_flow_scan_history(
 
     conn.commit()
     conn.close()
+
+
+# ============== SIGNAL OUTCOME TRACKING ==============
+
+def log_signal_outcome(
+    signal_id: int,
+    trade_id: int,
+    symbol: str,
+    signal_score: int,
+    signal_factors: dict,
+    entry_greeks: dict,
+    outcome: dict,
+):
+    """
+    Log signal outcome for learning loop analysis.
+
+    Args:
+        signal_id: ID from flow_signals table
+        trade_id: ID from options_trades table
+        symbol: Underlying symbol
+        signal_score: Signal score (0-20)
+        signal_factors: Dict with was_sweep, was_ask_side, was_floor, etc.
+        entry_greeks: Dict with delta, theta, iv at entry
+        outcome: Dict with entry_price, exit_price, max_price, min_price, etc.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Determine premium tier
+    premium = signal_factors.get('premium', 0)
+    if premium >= 250000:
+        premium_tier = 'very_high'
+    elif premium >= 100000:
+        premium_tier = 'high'
+    elif premium >= 50000:
+        premium_tier = 'medium'
+    else:
+        premium_tier = 'low'
+
+    # Determine vol/oi tier
+    vol_oi = signal_factors.get('vol_oi_ratio', 0)
+    if vol_oi >= 3:
+        vol_oi_tier = 'very_high'
+    elif vol_oi >= 1:
+        vol_oi_tier = 'high'
+    else:
+        vol_oi_tier = 'normal'
+
+    # Calculate win/loss flags
+    actual_pnl = outcome.get('actual_pnl_pct', 0)
+    was_winner = 1 if actual_pnl > 0 else 0
+    hit_target = 1 if outcome.get('max_gain_pct', 0) >= 50 else 0  # 50% profit target
+    hit_stop = 1 if outcome.get('max_loss_pct', 0) <= -50 else 0   # 50% stop loss
+
+    cursor.execute("""
+        INSERT INTO flow_signal_outcomes (
+            signal_id, trade_id, symbol, signal_score,
+            was_sweep, was_ask_side, was_floor, was_opening,
+            premium_tier, vol_oi_tier, option_type, dte_at_entry,
+            entry_delta, entry_theta, entry_iv,
+            entry_price, max_price, min_price, exit_price,
+            max_gain_pct, max_loss_pct, actual_pnl_pct,
+            holding_days, exit_reason,
+            was_winner, hit_target, hit_stop
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        signal_id,
+        trade_id,
+        symbol,
+        signal_score,
+        1 if signal_factors.get('is_sweep') else 0,
+        1 if signal_factors.get('is_ask_side') else 0,
+        1 if signal_factors.get('is_floor') else 0,
+        1 if signal_factors.get('is_opening') else 0,
+        premium_tier,
+        vol_oi_tier,
+        signal_factors.get('option_type'),
+        signal_factors.get('dte', 0),
+        entry_greeks.get('delta'),
+        entry_greeks.get('theta'),
+        entry_greeks.get('iv'),
+        outcome.get('entry_price'),
+        outcome.get('max_price'),
+        outcome.get('min_price'),
+        outcome.get('exit_price'),
+        outcome.get('max_gain_pct'),
+        outcome.get('max_loss_pct'),
+        actual_pnl,
+        outcome.get('holding_days', 0),
+        outcome.get('exit_reason'),
+        was_winner,
+        hit_target,
+        hit_stop,
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_signal_factor_performance() -> dict:
+    """
+    Analyze which signal factors correlate with winning trades.
+
+    Returns:
+        Dict with win rates for each factor
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    factors = ["was_sweep", "was_ask_side", "was_floor", "was_opening"]
+    results = {}
+
+    for factor in factors:
+        cursor.execute(f"""
+            SELECT
+                {factor} as factor_value,
+                COUNT(*) as total,
+                SUM(was_winner) as wins,
+                AVG(actual_pnl_pct) as avg_pnl
+            FROM flow_signal_outcomes
+            WHERE {factor} IS NOT NULL
+            GROUP BY {factor}
+        """)
+
+        rows = cursor.fetchall()
+        factor_results = []
+        for row in rows:
+            total = row['total']
+            wins = row['wins'] or 0
+            factor_results.append({
+                "present": bool(row['factor_value']),
+                "total": total,
+                "wins": wins,
+                "win_rate": round((wins / total * 100) if total > 0 else 0, 1),
+                "avg_pnl": round(row['avg_pnl'] or 0, 2),
+            })
+        results[factor] = factor_results
+
+    # Premium tier analysis
+    cursor.execute("""
+        SELECT
+            premium_tier,
+            COUNT(*) as total,
+            SUM(was_winner) as wins,
+            AVG(actual_pnl_pct) as avg_pnl
+        FROM flow_signal_outcomes
+        WHERE premium_tier IS NOT NULL
+        GROUP BY premium_tier
+        ORDER BY CASE premium_tier
+            WHEN 'very_high' THEN 1
+            WHEN 'high' THEN 2
+            WHEN 'medium' THEN 3
+            ELSE 4
+        END
+    """)
+    results['premium_tier'] = [
+        {
+            "tier": row['premium_tier'],
+            "total": row['total'],
+            "wins": row['wins'] or 0,
+            "win_rate": round(((row['wins'] or 0) / row['total'] * 100) if row['total'] > 0 else 0, 1),
+            "avg_pnl": round(row['avg_pnl'] or 0, 2),
+        }
+        for row in cursor.fetchall()
+    ]
+
+    # Vol/OI tier analysis
+    cursor.execute("""
+        SELECT
+            vol_oi_tier,
+            COUNT(*) as total,
+            SUM(was_winner) as wins,
+            AVG(actual_pnl_pct) as avg_pnl
+        FROM flow_signal_outcomes
+        WHERE vol_oi_tier IS NOT NULL
+        GROUP BY vol_oi_tier
+    """)
+    results['vol_oi_tier'] = [
+        {
+            "tier": row['vol_oi_tier'],
+            "total": row['total'],
+            "wins": row['wins'] or 0,
+            "win_rate": round(((row['wins'] or 0) / row['total'] * 100) if row['total'] > 0 else 0, 1),
+            "avg_pnl": round(row['avg_pnl'] or 0, 2),
+        }
+        for row in cursor.fetchall()
+    ]
+
+    conn.close()
+    return results
+
+
+def get_score_tier_performance() -> list:
+    """
+    Analyze win rate by signal score tier.
+
+    Returns:
+        List of dicts with tier performance
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            CASE
+                WHEN signal_score >= 15 THEN 'elite (15+)'
+                WHEN signal_score >= 12 THEN 'high (12-14)'
+                WHEN signal_score >= 10 THEN 'medium (10-11)'
+                ELSE 'low (8-9)'
+            END as tier,
+            COUNT(*) as total,
+            SUM(was_winner) as wins,
+            AVG(actual_pnl_pct) as avg_pnl,
+            AVG(max_gain_pct) as avg_max_gain,
+            AVG(max_loss_pct) as avg_max_loss,
+            AVG(holding_days) as avg_holding
+        FROM flow_signal_outcomes
+        GROUP BY tier
+        ORDER BY MIN(signal_score) DESC
+    """)
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [
+        {
+            "tier": row['tier'],
+            "total": row['total'],
+            "wins": row['wins'] or 0,
+            "win_rate": round(((row['wins'] or 0) / row['total'] * 100) if row['total'] > 0 else 0, 1),
+            "avg_pnl": round(row['avg_pnl'] or 0, 2),
+            "avg_max_gain": round(row['avg_max_gain'] or 0, 1),
+            "avg_max_loss": round(row['avg_max_loss'] or 0, 1),
+            "avg_holding_days": round(row['avg_holding'] or 0, 1),
+        }
+        for row in rows
+    ]
+
+
+def get_options_trade_with_greeks(trade_id: int) -> dict:
+    """Get options trade with all Greeks data"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM options_trades WHERE id = ?", (trade_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    return dict(row) if row else None
 
 
 if __name__ == "__main__":
