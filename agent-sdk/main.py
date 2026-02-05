@@ -151,28 +151,49 @@ async def run_continuous(orchestrator: OptionsOrchestrator, logger):
         # Run until shutdown
         while not shutdown_event.is_set():
             try:
-                # Run scan cycle
-                await orchestrator.run_scan_cycle()
+                # Check market hours
+                market_open = orchestrator._is_market_hours()
 
-                # Check positions
-                await orchestrator.run_position_check()
+                if market_open:
+                    # Sync state from Alpaca
+                    orchestrator._sync_positions_to_state()
+                    orchestrator._sync_portfolio_to_state()
+
+                    # Run scan cycle
+                    await orchestrator.run_scan_cycle()
+
+                    # Check positions
+                    await orchestrator.run_position_check()
+
+                    # Save state
+                    orchestrator._save_state()
+
+                    # Wait for next cycle
+                    sleep_time = orchestrator.session.scan_interval_seconds
+                else:
+                    # Outside market hours - save state and sleep longer
+                    orchestrator._save_state()
+                    sleep_time = 300  # 5 minutes
+                    logger.debug("Outside market hours, sleeping 5 minutes")
 
                 # Wait for next cycle or shutdown
                 try:
                     await asyncio.wait_for(
                         shutdown_event.wait(),
-                        timeout=orchestrator.session.scan_interval_seconds
+                        timeout=sleep_time
                     )
                 except asyncio.TimeoutError:
                     pass  # Normal timeout, continue loop
 
             except Exception as e:
                 logger.error(f"Cycle error: {e}")
+                orchestrator._save_state()
                 await asyncio.sleep(60)
 
     finally:
         # Cleanup
         logger.info("Shutting down orchestrator...")
+        orchestrator._save_state()  # Final state save
         summary = orchestrator.get_session_summary()
         logger.info(f"Final session summary: {summary}")
 
