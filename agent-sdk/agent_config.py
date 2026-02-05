@@ -176,7 +176,7 @@ class Config:
 
     # Logging
     log_level: str = "INFO"
-    log_dir: str = "logs"
+    log_dir: str = "/home/ubuntu/momentum-agent/logs/agent-sdk"
 
     # Market hours (ET)
     market_open_hour: int = 9

@@ -17,16 +17,16 @@ import json
 import pytz
 from anthropic import Anthropic
 
-from .definitions import (
+from agents.definitions import (
     ORCHESTRATOR_PROMPT,
     FLOW_SCANNER_PROMPT,
     POSITION_MANAGER_PROMPT,
     RISK_MANAGER_PROMPT,
     EXECUTOR_PROMPT,
 )
-from .hooks import SafetyGateHook, get_execution_state
-from ..config import config, Config
-from ..tools import TOOL_REGISTRY, TOOL_DESCRIPTIONS
+from agents.hooks import SafetyGateHook, get_execution_state
+from agent_config import config, Config
+from tools import TOOL_REGISTRY, TOOL_DESCRIPTIONS
 
 logger = logging.getLogger(__name__)
 ET = pytz.timezone("America/New_York")

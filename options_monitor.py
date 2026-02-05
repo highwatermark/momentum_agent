@@ -124,11 +124,11 @@ async def send_telegram(message: str, parse_mode: str = "Markdown"):
         logger.error(f"Telegram send failed: {e}")
 
 
-def send_telegram_sync(message: str):
+def send_telegram_sync(message: str, parse_mode: str = "Markdown"):
     """Synchronous wrapper for send_telegram"""
     import asyncio
     try:
-        asyncio.run(send_telegram(message))
+        asyncio.run(send_telegram(message, parse_mode=parse_mode))
     except Exception as e:
         logger.error(f"Telegram sync send failed: {e}")
 

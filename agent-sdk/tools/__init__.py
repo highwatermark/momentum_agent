@@ -3,7 +3,7 @@ MCP Tool definitions for AI-Native Options Flow Trading System.
 
 These tools wrap existing functionality and expose them to Claude agents.
 """
-from .alpaca_mcp import (
+from tools.alpaca_mcp import (
     get_positions,
     get_quote,
     get_account_info,
@@ -15,12 +15,12 @@ from .alpaca_mcp import (
     estimate_greeks,
     portfolio_greeks,
 )
-from .unusual_whales_mcp import (
+from tools.unusual_whales_mcp import (
     uw_flow_scan,
     iv_rank,
     earnings_check,
 )
-from .telegram_mcp import (
+from tools.telegram_mcp import (
     send_notification,
     send_alert,
 )

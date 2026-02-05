@@ -21,10 +21,15 @@ from pathlib import Path
 
 import pytz
 
-# Add parent directory for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add current directory first (for local config), then parent (for existing modules)
+_current_dir = str(Path(__file__).parent)
+_parent_dir = str(Path(__file__).parent.parent)
+if _current_dir not in sys.path:
+    sys.path.insert(0, _current_dir)
+if _parent_dir not in sys.path:
+    sys.path.append(_parent_dir)  # Append parent, not insert - local takes priority
 
-from config import config, Config
+from agent_config import config, Config
 from agents import OptionsOrchestrator
 
 ET = pytz.timezone("America/New_York")

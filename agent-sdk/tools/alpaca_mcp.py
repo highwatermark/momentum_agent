@@ -16,15 +16,53 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from options_executor import (
     get_options_positions as _get_options_positions,
     get_option_quote as _get_option_quote,
-    get_stock_quote as _get_stock_quote,
     find_option_contract as _find_option_contract,
     get_account_info as _get_account_info,
     close_options_position as _close_options_position,
     estimate_greeks as _estimate_greeks,
     get_portfolio_greeks as _get_portfolio_greeks,
-    execute_options_trade as _execute_options_trade,
-    calculate_dte,
+    place_options_order_smart as _place_options_order_smart,
 )
+from datetime import datetime
+
+
+def calculate_dte(expiration) -> int:
+    """Calculate days to expiration."""
+    if expiration is None:
+        return 0
+    if isinstance(expiration, str):
+        exp_date = datetime.strptime(expiration, "%Y-%m-%d").date()
+    else:
+        exp_date = expiration
+    return (exp_date - date.today()).days
+
+
+def _get_stock_quote(symbol: str) -> Optional[Dict]:
+    """Get stock quote using Alpaca API."""
+    try:
+        import os
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestQuoteRequest
+
+        client = StockHistoricalDataClient(
+            os.getenv("ALPACA_API_KEY"),
+            os.getenv("ALPACA_SECRET_KEY")
+        )
+        request = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
+        quotes = client.get_stock_latest_quote(request)
+
+        if symbol in quotes:
+            quote = quotes[symbol]
+            return {
+                "bid": float(quote.bid_price),
+                "ask": float(quote.ask_price),
+                "last": None,
+                "volume": None,
+            }
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching stock quote: {e}")
+        return None
 
 logger = logging.getLogger(__name__)
 
@@ -303,15 +341,18 @@ def place_order(
         Dict with order status, fill price, order ID
     """
     try:
-        result = _execute_options_trade(
-            symbol=underlying,
-            option_type=option_type,
-            strike=strike,
-            expiration=expiration,
-            qty=qty,
-            limit_price=limit_price,
-            signal_score=signal_score,
-            flow_signal_id=signal_id,
+        result = _place_options_order_smart(
+            contract_symbol=symbol,
+            quantity=qty,
+            side="buy",
+            signal_data={
+                "signal_score": signal_score,
+                "flow_signal_id": signal_id,
+                "underlying": underlying,
+                "option_type": option_type,
+                "strike": strike,
+                "expiration": expiration,
+            },
         )
 
         if result.get("success"):
