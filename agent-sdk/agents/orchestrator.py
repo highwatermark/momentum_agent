@@ -27,6 +27,7 @@ from agents.definitions import (
 from agents.hooks import SafetyGateHook, get_execution_state
 from agent_config import config, Config
 from tools import TOOL_REGISTRY, TOOL_DESCRIPTIONS
+from state import StateManager, TradingState, load_state, save_state
 
 logger = logging.getLogger(__name__)
 ET = pytz.timezone("America/New_York")
@@ -98,7 +99,7 @@ class OptionsOrchestrator:
     - Adaptive behavior based on context
     """
 
-    def __init__(self, config: Config = config):
+    def __init__(self, config: Config = config, resume_session: bool = True):
         self.config = config
         self.client = Anthropic(api_key=config.anthropic_api_key)
         self.safety_hook = SafetyGateHook(
@@ -106,9 +107,26 @@ class OptionsOrchestrator:
             telegram_notifier=None,  # Set up separately
         )
 
-        # Session state
+        # State persistence manager
+        self.state_manager = StateManager()
+
+        # Generate session ID
+        session_id = self._generate_session_id()
+
+        # Load or create trading state
+        if resume_session:
+            self.trading_state = self.state_manager.load(session_id)
+            logger.info(f"Resumed state: {len(self.trading_state.positions)} positions, {len(self.trading_state.signals)} signals")
+        else:
+            self.trading_state = TradingState(
+                session_id=session_id,
+                session_start=datetime.now(ET).isoformat(),
+                trading_date=datetime.now(ET).strftime("%Y-%m-%d"),
+            )
+
+        # Session state (legacy, kept for compatibility)
         self.session = SessionState(
-            session_id=self._generate_session_id(),
+            session_id=self.trading_state.session_id,
             started_at=datetime.now(ET),
         )
 
@@ -163,36 +181,56 @@ class OptionsOrchestrator:
         return market_open <= now <= market_close
 
     def _build_context(self) -> str:
-        """Build current context for the orchestrator."""
-        exec_state = get_execution_state()
+        """Build current context for the orchestrator from persisted state."""
+        # Update market hours in state
+        self.trading_state.market["market_hours"] = self._is_market_hours()
 
-        context = f"""
-CURRENT STATE
-=============
-Time: {datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S ET')}
-Market Hours: {'YES' if self._is_market_hours() else 'NO'}
+        # Return formatted state context
+        return self.trading_state.to_prompt_context()
 
-Execution State:
-- Executions Today: {exec_state.executions_today}/3
-- Positions: {exec_state.positions_count}/4
-- Daily P/L: ${exec_state.daily_pnl:.2f}
-- Circuit Breaker: {'OPEN' if exec_state.circuit_breaker_open else 'CLOSED'}
+    def _sync_positions_to_state(self):
+        """Sync current positions from Alpaca to state."""
+        try:
+            from tools import get_positions
+            result = get_positions()
+            if result.get("success") and result.get("data"):
+                positions = result["data"].get("positions", [])
+                self.trading_state = self.state_manager.update_positions(
+                    self.trading_state, positions
+                )
+                logger.debug(f"Synced {len(positions)} positions to state")
+        except Exception as e:
+            logger.warning(f"Failed to sync positions: {e}")
 
-Session Activity:
-- Signals Seen Today: {len(self.session.signals_seen_today)}
-- Trades Today: {len(self.session.trades_today)}
-- Last Scan: {self.session.last_scan_time.strftime('%H:%M:%S') if self.session.last_scan_time else 'Never'}
+    def _sync_portfolio_to_state(self):
+        """Sync portfolio summary from Alpaca to state."""
+        try:
+            from tools import portfolio_greeks, get_account_info
 
-Recent Signals (last 5):
-"""
-        for signal in self.session.signals_seen_today[-5:]:
-            context += f"- {signal.get('symbol')} {signal.get('option_type')} ${signal.get('strike')} Score:{signal.get('score')}\n"
+            # Get account info
+            account_result = get_account_info()
+            if account_result.get("success") and account_result.get("data"):
+                account = account_result["data"]
+                self.trading_state.portfolio["total_value"] = account.get("equity", 0)
+                self.trading_state.portfolio["cash_available"] = account.get("cash", 0)
 
-        context += "\nRecent Trades (today):\n"
-        for trade in self.session.trades_today:
-            context += f"- {trade.get('symbol')} {trade.get('action')} P/L: ${trade.get('pnl', 0):.2f}\n"
+            # Get portfolio Greeks
+            greeks_result = portfolio_greeks()
+            if greeks_result.get("success") and greeks_result.get("data"):
+                greeks = greeks_result["data"]
+                self.trading_state.portfolio["net_delta"] = greeks.get("net_delta", 0)
+                self.trading_state.portfolio["daily_theta"] = greeks.get("daily_theta", 0)
+                self.trading_state.portfolio["options_exposure"] = greeks.get("total_exposure", 0)
+                self.trading_state.portfolio["risk_score"] = greeks.get("risk_score", 0)
 
-        return context
+            logger.debug("Synced portfolio to state")
+        except Exception as e:
+            logger.warning(f"Failed to sync portfolio: {e}")
+
+    def _save_state(self):
+        """Save current state to disk."""
+        self.state_manager.save(self.trading_state)
+        logger.debug("State saved to disk")
 
     def _build_tool_schema(self, tool_names: List[str]) -> List[Dict]:
         """Build Claude tool schema for specified tools."""
@@ -581,36 +619,50 @@ Recent Signals (last 5):
         Main orchestration loop.
 
         Runs continuously during market hours, coordinating subagents.
+        State is synced and saved each cycle for persistence.
         """
         logger.info("Starting orchestration loop")
 
         while True:
             try:
-                if self._is_market_hours():
-                    # Run scan cycle
+                market_open = self._is_market_hours()
+                logger.debug(f"Market hours check: {market_open}, time: {datetime.now(ET).strftime('%H:%M:%S')}")
+
+                if market_open:
+                    # Sync positions and portfolio from Alpaca to state
+                    self._sync_positions_to_state()
+                    self._sync_portfolio_to_state()
+
+                    # Run scan cycle (has its own market hours check)
                     await self.run_scan_cycle()
 
                     # Check positions
                     await self.run_position_check()
 
-                    # Adaptive sleep based on activity
+                # Save state after each cycle (always)
+                self._save_state()
+
+                # Sleep based on market hours
+                if market_open:
                     await asyncio.sleep(self.session.scan_interval_seconds)
                 else:
-                    # Outside market hours - longer sleep
                     logger.debug("Outside market hours, sleeping 5 minutes")
                     await asyncio.sleep(300)
 
             except KeyboardInterrupt:
                 logger.info("Orchestration loop interrupted")
+                self._save_state()  # Save on shutdown
                 break
             except Exception as e:
                 logger.error(f"Orchestration loop error: {e}")
+                self._save_state()  # Save on error
                 await asyncio.sleep(60)
 
     def get_session_summary(self) -> Dict:
         """Get summary of current session."""
         return {
             **self.session.to_dict(),
+            "trading_state": self.trading_state.to_dict(),
             "execution_state": asdict(get_execution_state()) if get_execution_state() else {},
         }
 

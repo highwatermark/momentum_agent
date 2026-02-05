@@ -98,7 +98,7 @@ This implementation replaces the current polling-based, stateless AI integration
 agent-sdk/
 ├── README.md                 # This file
 ├── requirements.txt          # Dependencies
-├── config.py                 # Agent configuration
+├── agent_config.py           # Agent configuration
 ├── main.py                   # Entry point
 ├── agents/
 │   ├── __init__.py
@@ -129,24 +129,84 @@ python main.py --shadow
 python main.py
 ```
 
+## State Persistence
+
+The orchestrator maintains state across cycles and sessions via `trading_state.json`:
+
+```
+/home/ubuntu/momentum-agent/data/trading_state.json
+```
+
+### State Contents
+
+| Field | Description |
+|-------|-------------|
+| `session_id` | Current session identifier |
+| `trading_date` | Current trading date (resets daily counters) |
+| `executions_today` | Number of trades executed today (max 3) |
+| `positions` | Active positions synced from Alpaca |
+| `signals` | Signals seen today (last 50) |
+| `trades` | Trades executed today |
+| `portfolio` | Portfolio summary (value, Greeks, risk score) |
+| `market` | Market context (SPY, VIX, market hours) |
+| `circuit_breaker` | Circuit breaker state |
+| `recent_decisions` | Last 20 decisions for context |
+
+### State Lifecycle
+
+1. **Startup**: Load existing state or create new
+2. **Each Cycle**: Sync positions/portfolio from Alpaca, update state
+3. **After Cycle**: Save state to disk
+4. **New Day**: Reset daily counters, preserve positions
+5. **Session Resume**: Load previous state with new session ID
+
+### Prompt Injection
+
+Each cycle, the state is formatted and injected into the orchestrator's prompt:
+
+```
+============================================================
+CURRENT TRADING STATE
+============================================================
+Session: orch-20260205-abc12345
+Date: 2026-02-05
+
+EXECUTION STATUS:
+  Trades Today: 1/3
+  Signals Seen: 12
+  Executions Remaining: 2
+
+PORTFOLIO:
+  Total Value: $125,000.00
+  Options Exposure: $4,500.00
+  Net Delta: 45.2
+  Risk Score: 35/100
+
+ACTIVE POSITIONS (2):
+  🟢 SPY CALL $500 exp 2026-02-21
+     Entry: $3.50 | Current: $4.20 | P/L: +20.0%
+  ...
+============================================================
+```
+
 ## Migration Roadmap
 
 ### Phase 1: Foundation (1-2 weeks)
 - [x] Create MCP tool wrappers for existing functions
-- [ ] Implement basic orchestrator without subagents
-- [ ] Add session persistence
+- [x] Implement basic orchestrator with subagents
+- [x] Add session/state persistence
 - [ ] Test single-agent flow
 
 ### Phase 2: Subagent Architecture (2-3 weeks)
-- [ ] Implement FlowScanner subagent
-- [ ] Implement PositionManager subagent
-- [ ] Implement RiskManager subagent
-- [ ] Implement Executor subagent
-- [ ] Orchestrator coordination logic
+- [x] Implement FlowScanner subagent
+- [x] Implement PositionManager subagent
+- [x] Implement RiskManager subagent
+- [x] Implement Executor subagent
+- [x] Orchestrator coordination logic
 
 ### Phase 3: Context & Memory (1-2 weeks)
-- [ ] Session resume/fork functionality
-- [ ] Signal history in context window
+- [x] Session resume/fork functionality
+- [x] Signal history in context window
 - [ ] Trade outcome feedback loop
 - [ ] Compaction strategy for long sessions
 
@@ -183,12 +243,15 @@ These are implemented as hooks that CANNOT be bypassed by the agent.
 ## Monitoring
 
 ```bash
-# View agent logs
-tail -f logs/agent.log
+# View agent logs (logs stored in parent project's logs directory)
+tail -f /home/ubuntu/momentum-agent/logs/agent-sdk/agent_$(date +%Y%m%d).log
 
-# View trade execution logs
-tail -f logs/trades.log
+# Follow via journalctl
+sudo journalctl -u agent-sdk -f
 
-# Check session state
-python -c "from main import get_session_state; print(get_session_state())"
+# Check service status
+sudo systemctl status agent-sdk
+
+# Restart service
+sudo systemctl restart agent-sdk
 ```
