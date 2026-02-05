@@ -40,6 +40,7 @@ class FlowSignal:
     sentiment: str  # 'bullish' or 'bearish'
     score: int = 0
     score_breakdown: Dict = field(default_factory=dict)
+    db_id: int = None  # Database row ID after logging
 
 
 class UnusualWhalesClient:

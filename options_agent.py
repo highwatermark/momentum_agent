@@ -19,6 +19,7 @@ from config import (
     OPTIONS_CONFIG,
     OPTIONS_SAFETY,
     TRADING_CONFIG,
+    FLOW_LISTENER_CONFIG,
 )
 
 # Configure logging
@@ -1310,3 +1311,248 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("TEST COMPLETE")
     print("=" * 60)
+
+
+# ============================================================================
+# FLOW VALIDATOR - Claude-based flow signal validation
+# ============================================================================
+
+@dataclass
+class FlowSignalInput:
+    """Input data for a single flow signal"""
+    signal_id: str
+    symbol: str
+    strike: float
+    expiration: str
+    option_type: str  # 'call' or 'put'
+    premium: float
+    size: int
+    vol_oi_ratio: float
+    is_sweep: bool
+    is_ask_side: bool
+    is_floor: bool
+    is_opening: bool
+    is_otm: bool
+    underlying_price: float
+    sentiment: str  # 'bullish' or 'bearish'
+    # Symbol context
+    days_to_earnings: int = 999
+    iv_rank: float = 50.0
+    sector: str = "unknown"
+
+
+@dataclass
+class FlowValidationInput:
+    """Input data for flow validation (batched signals + context)"""
+    signals: List[FlowSignalInput]
+    # Market context
+    spy_price: float
+    spy_change_pct: float
+    spy_trend: str  # 'uptrend', 'downtrend', 'sideways'
+    vix_level: float
+    sector_performance: Dict[str, float]
+    current_time: str
+    # Portfolio context
+    equity: float
+    options_positions: List[Dict]
+    net_delta: float
+    daily_theta: float
+    options_exposure_pct: float
+    risk_score: int
+    risk_assessment: str
+    available_capital: float
+    position_count: int
+    max_positions: int
+
+
+@dataclass
+class FlowValidationResult:
+    """Result for a single signal validation"""
+    signal_id: str
+    symbol: str
+    recommendation: str  # 'EXECUTE', 'ALERT', 'SKIP'
+    conviction: int  # 0-100
+    thesis: str
+    risk_factors: List[str]
+    suggested_contracts: int
+    profit_target: str
+    stop_loss: str
+
+
+def validate_flow_signals(
+    validation_input: FlowValidationInput,
+    use_agent: bool = True
+) -> List[FlowValidationResult]:
+    """
+    Validate flow signals using Claude AI.
+
+    Returns list of FlowValidationResult sorted by execution priority.
+    """
+    logger.info(f"[FlowValidator] Validating {len(validation_input.signals)} signals")
+
+    if not validation_input.signals:
+        return []
+
+    if use_agent and ANTHROPIC_API_KEY:
+        result = _validate_with_agent(validation_input)
+        if result:
+            return result
+        logger.warning("[FlowValidator] Agent failed, no fallback for flow validation")
+
+    # No rules-based fallback - flow validation requires Claude
+    logger.warning("[FlowValidator] Skipping validation - Claude unavailable")
+    return []
+
+
+def _validate_with_agent(validation_input: FlowValidationInput) -> Optional[List[FlowValidationResult]]:
+    """Use Claude to validate flow signals"""
+
+    # Format signals for prompt
+    signals_text = ""
+    for i, sig in enumerate(validation_input.signals, 1):
+        sweep_tag = " [SWEEP]" if sig.is_sweep else ""
+        floor_tag = " [FLOOR]" if sig.is_floor else ""
+        ask_tag = " [ASK-SIDE]" if sig.is_ask_side else ""
+        opening_tag = " [OPENING]" if sig.is_opening else ""
+        otm_tag = " [OTM]" if sig.is_otm else ""
+
+        signals_text += f"""
+Signal {i} (ID: {sig.signal_id}):
+- Symbol: {sig.symbol}
+- Flow: {sig.option_type.upper()} ${sig.strike} exp {sig.expiration}
+- Premium: ${sig.premium:,.0f}
+- Characteristics:{sweep_tag}{floor_tag}{ask_tag}{opening_tag}{otm_tag}
+- Vol/OI: {sig.vol_oi_ratio:.1f}x
+- Underlying: ${sig.underlying_price:.2f}
+- Sentiment: {sig.sentiment}
+- Earnings: {sig.days_to_earnings} days away
+- IV Rank: {sig.iv_rank:.0f}
+- Sector: {sig.sector}
+"""
+
+    # Format positions
+    positions_text = ""
+    if validation_input.options_positions:
+        for pos in validation_input.options_positions[:5]:
+            pnl = pos.get('unrealized_plpc', 0) * 100
+            emoji = "+" if pnl >= 0 else ""
+            positions_text += f"  {pos.get('symbol', 'N/A')} {pos.get('option_type', '').upper()} ${pos.get('strike', 0)} | {emoji}{pnl:.1f}% | Delta: {pos.get('delta', 0):.2f}\n"
+    else:
+        positions_text = "  (no current positions)"
+
+    # Build prompt
+    prompt = f"""CURRENT MARKET CONTEXT:
+- SPY: ${validation_input.spy_price:.2f} ({validation_input.spy_change_pct:+.1%}), Trend: {validation_input.spy_trend}
+- VIX: {validation_input.vix_level:.1f}
+- Time: {validation_input.current_time}
+
+PORTFOLIO CONTEXT:
+- Equity: ${validation_input.equity:,.0f}
+- Current Options Positions: {validation_input.position_count}/{validation_input.max_positions}
+{positions_text}
+- Net Delta: {validation_input.net_delta:.0f}
+- Daily Theta: ${validation_input.daily_theta:.0f}
+- Options Exposure: {validation_input.options_exposure_pct:.1f}%
+- Risk Score: {validation_input.risk_score}/100 ({validation_input.risk_assessment})
+- Available for new position: ~${validation_input.available_capital:,.0f}
+
+SIGNALS TO ANALYZE:
+{signals_text}
+
+For each signal, provide a JSON object with:
+- signal_id: string (the ID from the signal)
+- symbol: string
+- recommendation: "EXECUTE" | "ALERT" | "SKIP"
+- conviction: 0-100 (75+ for EXECUTE, 50-74 for ALERT, <50 for SKIP)
+- thesis: Profit-focused reasoning (why this trade or why not)
+- risk_factors: list of concerns
+- suggested_contracts: 1-5 (0 if SKIP)
+- profit_target: target like "50%" or specific price
+- stop_loss: stop like "50%" or specific condition
+
+Return a JSON array ranked by execution priority. Focus on PROFIT POTENTIAL."""
+
+    system_prompt = """You are an autonomous options flow trading agent. Your PRIMARY OBJECTIVE is to
+GENERATE PROFITS by identifying and executing high-conviction options trades
+based on unusual institutional flow.
+
+PROFIT MANDATE:
+- You are measured by P/L performance
+- Capital preservation is important, but excessive caution destroys returns
+- The best traders have ~40-50% win rate with 2:1+ reward/risk ratio
+- Missing a profitable trade is as costly as taking a losing trade
+- Act decisively on high-conviction signals
+
+DECISION FRAMEWORK:
+- EXECUTE: High conviction (75%+), clear institutional signal, favorable risk/reward
+- ALERT: Interesting signal worth human review (50-74% conviction)
+- SKIP: Low conviction, unclear thesis, or unfavorable conditions (<50%)
+
+PORTFOLIO-AWARE DECISIONS:
+- Consider current delta exposure when adding directional trades
+- Avoid concentration in single sector or underlying
+- Factor in existing theta decay when adding positions
+- Respect position limits but don't be overly conservative
+
+Return ONLY valid JSON array, no other text."""
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2000,
+            system=system_prompt,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        response_text = response.content[0].text.strip()
+
+        # Parse JSON response
+        # Handle potential markdown code blocks
+        if response_text.startswith("```"):
+            lines = response_text.split("\n")
+            response_text = "\n".join(lines[1:-1])
+
+        results_data = json.loads(response_text)
+
+        # Convert to FlowValidationResult objects
+        results = []
+        for item in results_data:
+            result = FlowValidationResult(
+                signal_id=item.get("signal_id", ""),
+                symbol=item.get("symbol", ""),
+                recommendation=item.get("recommendation", "SKIP"),
+                conviction=item.get("conviction", 0),
+                thesis=item.get("thesis", ""),
+                risk_factors=item.get("risk_factors", []),
+                suggested_contracts=item.get("suggested_contracts", 0),
+                profit_target=item.get("profit_target", "50%"),
+                stop_loss=item.get("stop_loss", "50%"),
+            )
+            results.append(result)
+
+        logger.info(f"[FlowValidator] Validated {len(results)} signals")
+        for r in results:
+            logger.info(f"  {r.symbol}: {r.recommendation} ({r.conviction}%)")
+
+        return results
+
+    except json.JSONDecodeError as e:
+        logger.error(f"[FlowValidator] JSON parse error: {e}")
+        logger.error(f"[FlowValidator] Raw response: {response_text[:500]}")
+        return None
+    except Exception as e:
+        logger.exception(f"[FlowValidator] Error: {e}")
+        return None
+
+
+def format_flow_validation_result(result: FlowValidationResult) -> str:
+    """Format a validation result for display/logging"""
+    emoji = {"EXECUTE": "🚀", "ALERT": "👀", "SKIP": "⏭️"}.get(result.recommendation, "❓")
+
+    return f"""{emoji} {result.symbol} - {result.recommendation} ({result.conviction}%)
+Thesis: {result.thesis}
+Risk: {', '.join(result.risk_factors) if result.risk_factors else 'None'}
+Size: {result.suggested_contracts} contracts
+Target: {result.profit_target} | Stop: {result.stop_loss}"""

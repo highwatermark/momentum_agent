@@ -643,3 +643,222 @@ AAPL260220C00100000:
 8. "Flow Job Complete" - portfolio summary
 
 **Status**: Cron installed, ready for 2026-02-04 market session.
+
+### 2026-02-04 03:53 EST - Real-Time Flow Listener Service
+
+**Change**: Replaced cron-based options flow scanning with real-time 60-second polling service using Claude AI for intelligent signal validation.
+
+**New Files Created**:
+- `flow_listener.py`: Real-time flow monitoring service (~830 lines)
+- `flow-listener.service`: Systemd service file for continuous operation
+- `docs/flow_listener_plan.md`: Implementation plan and architecture documentation
+
+**Files Modified**:
+- `config.py`: Added `FLOW_LISTENER_CONFIG` with all listener parameters
+- `db.py`: Added flow listener state management functions
+- `options_agent.py`: Added `FlowValidator` for Claude-based signal validation
+- `requirements.txt`: Added `aiohttp>=3.9.0`
+
+**Architecture - Three-Layer Safety**:
+```
+Layer 1: Pre-Filter
+├── Premium >= $100K
+├── Dedupe against seen_signal_ids
+└── Exclude index options (SPX, SPXW, NDX, XSP)
+
+Layer 2: Claude Validation
+├── Profit-focused system prompt
+├── Conviction scoring (0-100%)
+├── Thesis generation
+└── Risk factor assessment
+
+Layer 3: Safety Gate (Hard Limits Override Claude)
+├── Daily execution limit (3)
+├── Position count limit
+├── Delta per $100K equity limit (150)
+├── Theta as % of portfolio limit (0.3%)
+├── Sector concentration limit (50%)
+├── Duplicate position check
+└── Earnings blackout check
+
+Layer 4: Options Executor (Existing)
+├── Liquidity check
+├── Limit orders
+└── Greeks logging
+```
+
+**New Config (`FLOW_LISTENER_CONFIG`)**:
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `poll_interval_seconds` | 60 | Poll every 60 seconds |
+| `min_premium` | 100000 | $100K minimum premium filter |
+| `max_signals_per_cycle` | 10 | Max signals to send to Claude |
+| `excluded_symbols` | SPX, SPXW, NDX, XSP | Exclude index options |
+| `min_conviction_execute` | 75 | Auto-execute threshold |
+| `min_conviction_alert` | 50 | Alert-only threshold |
+| `max_executions_per_day` | 3 | Daily execution limit |
+| `max_delta_per_100k` | 150 | Max delta exposure |
+| `max_theta_pct` | 0.003 | Max 0.3% daily theta decay |
+| `max_risk_score` | 50 | Max portfolio risk score |
+| `enable_auto_execute` | True | Master switch |
+| `max_consecutive_errors` | 5 | Circuit breaker trigger |
+| `circuit_breaker_cooldown_seconds` | 300 | 5 min cooldown |
+
+**New Database Functions (db.py)**:
+| Function | Purpose |
+|----------|---------|
+| `init_flow_listener_tables()` | Create state and seen_signals tables |
+| `get_flow_listener_state()` | Read persistent state |
+| `update_flow_listener_state()` | Save state across restarts |
+| `increment_daily_execution_count()` | Track daily executions |
+| `reset_daily_execution_count()` | Reset at midnight |
+| `add_seen_signal_id()` | Dedupe tracking |
+| `is_signal_seen()` | Check if signal processed |
+| `update_flow_signal_action()` | Log signal outcomes |
+
+**New Validation Classes (options_agent.py)**:
+| Class | Purpose |
+|-------|---------|
+| `FlowSignalInput` | Signal data for validation |
+| `FlowValidationInput` | Full context (market + portfolio + signals) |
+| `FlowValidationResult` | Claude's recommendation and analysis |
+| `validate_flow_signals()` | Batched Claude validation with profit mandate |
+
+**Claude Prompt Emphasis**:
+- "Your PRIMARY OBJECTIVE is to GENERATE PROFITS"
+- Pre-fetched context (no tool use for predictable latency)
+- Batched validation (single call for all signals)
+- Expected cycle time: 12-18 seconds per 60-second poll
+
+**Cron Changes**:
+- **Removed**: `flow_job.py full` at 10:00 AM ET (15:00 UTC)
+- **Removed**: `flow_job.py full` at 2:00 PM ET (19:00 UTC)
+- **Kept**: `flow_job.py exits` - Every 30 min (exit checks)
+- **Kept**: `flow_job.py dte` - 9:30 AM ET (DTE alerts)
+
+**Systemd Service**:
+```bash
+# Control commands
+sudo systemctl status flow-listener    # Check status
+sudo systemctl restart flow-listener   # Restart
+sudo journalctl -u flow-listener -f    # Follow logs
+tail -f logs/flow_listener.log         # View logs
+```
+
+**Bug Fixes**:
+- **aiohttp ModuleNotFoundError**: Installed aiohttp and added to requirements.txt
+
+**Testing Results**:
+- All imports verified successful
+- CircuitBreaker unit tests passed
+- FlowListener initialization tested
+- Service started and running (PID 244310)
+
+**Service Status**:
+```
+● flow-listener.service - Momentum Agent Flow Listener
+     Loaded: loaded (/etc/systemd/system/flow-listener.service; enabled)
+     Active: active (running) since Wed 2026-02-04 08:51:20 UTC
+```
+
+**Status**: Deployed and running. Service polls every 60s during market hours (9:30 AM - 4:00 PM ET), sleeps outside market hours.
+
+### 2026-02-04 14:30 UTC - Flow Listener Bug Fixes
+
+**Issues Found**:
+1. `EnrichedFlowSignal.__init__()` got unexpected keyword arguments (`key_levels`, `catalyst_info`, `risk_factors`)
+2. `PortfolioReviewInput` missing `cash_available` parameter
+3. Timezone bug in `is_market_hours()` - was using `et.localize(datetime.now())` instead of `datetime.now(et)`
+
+**Files Modified**:
+- `flow_listener.py`: Fixed EnrichedFlowSignal constructor (removed outdated parameters)
+- `flow_listener.py`: Fixed timezone in is_market_hours()
+
+**Status**: Fixed, service restarted successfully.
+
+### 2026-02-04 16:00-19:00 UTC - Options Monitor Service Implementation
+
+**Change**: Created continuous Options Monitor Service for real-time position monitoring with event-driven AI evaluation.
+
+**New Files Created**:
+- `options_monitor.py`: Main monitoring service (~1325 lines)
+- `options-monitor.service`: Systemd service file
+
+**Files Modified**:
+- `config.py`: Added `OPTIONS_MONITOR_CONFIG` dict (lines 257-314)
+- `db.py`: Added 3 new tables (`options_monitor_state`, `position_greeks_history`, `monitor_alerts`) and 10+ CRUD functions
+- `options_executor.py`: Added `execute_roll()` function, fixed position detection bug
+
+**Key Features**:
+- Polls every 45 seconds during market hours
+- Event-driven AI calls (NOT scheduled daily reviews)
+- Triggers Claude when: losing > 15%, profit > 30%, DTE <= 7, high gamma, IV crush
+- Auto-executes CLOSE/ROLL decisions from AI
+- Rate limiting: 10-minute cooldown per position per trigger type
+- Adaptive profit targets by DTE (50%/40%/30%/20%)
+- Greeks snapshot every 5 minutes for IV tracking
+- Circuit breaker after 5 consecutive errors
+
+**Service Commands**:
+```bash
+sudo systemctl status options-monitor
+sudo systemctl restart options-monitor
+tail -f logs/options_monitor.log
+```
+
+**Status**: Deployed and running.
+
+### 2026-02-04 19:48 UTC - First Successful AI-Driven Exits
+
+**Results**: Monitor evaluated 3 positions, Claude recommended CLOSE (critical) for all, successfully exited:
+
+| Position | Entry | Exit | P/L | Reason |
+|----------|-------|------|-----|--------|
+| SPY PUT $684 | $7.50 | $4.98 | -$252 (-33.6%) | AI: losing_money_35% |
+| QQQ PUT $602 | $9.61 | $6.11 | -$350 (-36.4%) | AI: losing_money_37% |
+| IWM PUT $247 | $4.81 | $2.29 | -$252 (-52.4%) | AI: losing_money_52% |
+
+**Day's Total P/L**: -$590 (after closing 3 losing positions)
+
+**Note**: These positions had no `flow_signal_id` linkage - they were opened outside the automated flow system.
+
+### 2026-02-04 20:30 UTC - Critical Data Linkage Bugs Fixed
+
+**Bug 1: Signal Scores Not Calculated**
+- **Issue**: `score_flow_signal()` was never called after parsing signals
+- **Result**: All signals had `score = 0` in database
+- **Fix**: Added `signal = score_flow_signal(signal)` in filter loop
+- **File**: `flow_listener.py`
+
+**Bug 2: Database ID Not Linked to Trades**
+- **Issue**: `log_flow_signal()` returns database row ID but was ignored
+- **Result**: `signal.db_id` stayed `None`, trades had `flow_signal_id = NULL`
+- **Fix**:
+  - Added `db_id: int = None` field to `FlowSignal` dataclass
+  - Capture return value and set `signal.db_id = db_id`
+- **Files**: `flow_scanner.py`, `flow_listener.py`
+
+**Bug 3: Signal Outcome Logging Error**
+- **Issue**: `signal_data` assumed to be valid JSON, but might be string or dict
+- **Error**: "'str' object does not support item assignment"
+- **Fix**: Type checking before JSON parse
+- **File**: `options_executor.py`
+
+**Verification**: Signals now showing proper scores (30-78 range) in database.
+
+**Impact**: Future trades will have proper signal-to-trade linkage for performance analysis.
+
+### 2026-02-04 21:00 UTC - Telegram Notification Fixes
+
+**Issue**: Markdown parsing errors in Telegram messages
+
+**Root Cause**: Dynamic content (AI reasoning, contract symbols) contained special characters
+
+**Fix**:
+1. Added `escape_markdown()` function to escape `_`, `*`, backticks, brackets
+2. Added retry without parse_mode if markdown fails
+3. Escaped dynamic content in all notification functions
+
+**Files Modified**: `options_monitor.py`, `flow_listener.py`
+
+**Status**: Fixed, services restarted.

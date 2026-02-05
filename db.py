@@ -2756,6 +2756,615 @@ def get_options_trade_with_greeks(trade_id: int) -> dict:
     return dict(row) if row else None
 
 
+# ============================================================================
+# Flow Listener State Functions
+# ============================================================================
+
+def init_flow_listener_tables():
+    """Initialize flow listener state table and add columns to flow_signals if needed"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Create flow_listener_state table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS flow_listener_state (
+            id INTEGER PRIMARY KEY,
+            last_check_time TEXT,
+            daily_execution_count INTEGER DEFAULT 0,
+            last_reset_date TEXT,
+            seen_signal_ids TEXT,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Add action_taken column to flow_signals if not exists
+    try:
+        cursor.execute("ALTER TABLE flow_signals ADD COLUMN action_taken TEXT")
+    except Exception:
+        pass  # Column already exists
+
+    # Add claude_analysis column to flow_signals if not exists
+    try:
+        cursor.execute("ALTER TABLE flow_signals ADD COLUMN claude_analysis TEXT")
+    except Exception:
+        pass  # Column already exists
+
+    conn.commit()
+    conn.close()
+
+
+def get_flow_listener_state() -> dict:
+    """Get current flow listener state"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM flow_listener_state WHERE id = 1")
+    row = cursor.fetchone()
+    conn.close()
+
+    if row:
+        state = dict(row)
+        # Parse seen_signal_ids from JSON
+        if state.get('seen_signal_ids'):
+            import json
+            try:
+                state['seen_signal_ids'] = set(json.loads(state['seen_signal_ids']))
+            except Exception:
+                state['seen_signal_ids'] = set()
+        else:
+            state['seen_signal_ids'] = set()
+        return state
+
+    return {
+        'last_check_time': None,
+        'daily_execution_count': 0,
+        'last_reset_date': None,
+        'seen_signal_ids': set(),
+    }
+
+
+def update_flow_listener_state(
+    last_check_time: str = None,
+    daily_execution_count: int = None,
+    last_reset_date: str = None,
+    seen_signal_ids: set = None,
+):
+    """Update flow listener state"""
+    import json
+    from datetime import datetime
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Get current state
+    cursor.execute("SELECT * FROM flow_listener_state WHERE id = 1")
+    existing = cursor.fetchone()
+
+    if existing:
+        # Build update query
+        updates = []
+        params = []
+
+        if last_check_time is not None:
+            updates.append("last_check_time = ?")
+            params.append(last_check_time)
+        if daily_execution_count is not None:
+            updates.append("daily_execution_count = ?")
+            params.append(daily_execution_count)
+        if last_reset_date is not None:
+            updates.append("last_reset_date = ?")
+            params.append(last_reset_date)
+        if seen_signal_ids is not None:
+            updates.append("seen_signal_ids = ?")
+            params.append(json.dumps(list(seen_signal_ids)))
+
+        updates.append("updated_at = ?")
+        params.append(datetime.now().isoformat())
+        params.append(1)  # WHERE id = 1
+
+        cursor.execute(f"""
+            UPDATE flow_listener_state
+            SET {', '.join(updates)}
+            WHERE id = ?
+        """, params)
+    else:
+        # Insert new state
+        cursor.execute("""
+            INSERT INTO flow_listener_state (id, last_check_time, daily_execution_count, last_reset_date, seen_signal_ids, updated_at)
+            VALUES (1, ?, ?, ?, ?, ?)
+        """, (
+            last_check_time,
+            daily_execution_count or 0,
+            last_reset_date,
+            json.dumps(list(seen_signal_ids)) if seen_signal_ids else '[]',
+            datetime.now().isoformat(),
+        ))
+
+    conn.commit()
+    conn.close()
+
+
+def increment_daily_execution_count() -> int:
+    """Increment daily execution count and return new value"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE flow_listener_state
+        SET daily_execution_count = daily_execution_count + 1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = 1
+    """)
+
+    cursor.execute("SELECT daily_execution_count FROM flow_listener_state WHERE id = 1")
+    row = cursor.fetchone()
+    conn.commit()
+    conn.close()
+
+    return row['daily_execution_count'] if row else 1
+
+
+def reset_daily_execution_count(reset_date: str):
+    """Reset daily execution count for new day"""
+    update_flow_listener_state(
+        daily_execution_count=0,
+        last_reset_date=reset_date,
+    )
+
+
+def add_seen_signal_id(signal_id: str):
+    """Add a signal ID to seen set"""
+    import json
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT seen_signal_ids FROM flow_listener_state WHERE id = 1")
+    row = cursor.fetchone()
+
+    if row and row['seen_signal_ids']:
+        try:
+            seen = set(json.loads(row['seen_signal_ids']))
+        except Exception:
+            seen = set()
+    else:
+        seen = set()
+
+    seen.add(signal_id)
+
+    # Keep only last 1000 signal IDs to prevent unbounded growth
+    if len(seen) > 1000:
+        seen = set(list(seen)[-1000:])
+
+    update_flow_listener_state(seen_signal_ids=seen)
+
+
+def is_signal_seen(signal_id: str) -> bool:
+    """Check if a signal ID has been seen"""
+    state = get_flow_listener_state()
+    return signal_id in state.get('seen_signal_ids', set())
+
+
+def update_flow_signal_action(signal_id: str, action_taken: str, claude_analysis: str = None):
+    """Update flow signal with action taken and Claude analysis"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    if claude_analysis:
+        cursor.execute("""
+            UPDATE flow_signals
+            SET action_taken = ?, claude_analysis = ?
+            WHERE signal_id = ?
+        """, (action_taken, claude_analysis, signal_id))
+    else:
+        cursor.execute("""
+            UPDATE flow_signals
+            SET action_taken = ?
+            WHERE signal_id = ?
+        """, (action_taken, signal_id))
+
+    conn.commit()
+    conn.close()
+
+
+def get_flow_signals_by_action(action: str, limit: int = 20) -> list:
+    """Get flow signals by action taken"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT * FROM flow_signals
+        WHERE action_taken = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (action, limit))
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [dict(row) for row in rows]
+
+
+# ============================================================================
+# OPTIONS MONITOR STATE MANAGEMENT
+# ============================================================================
+
+def init_options_monitor_tables():
+    """Initialize options monitor tables"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Service state persistence
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS options_monitor_state (
+            id INTEGER PRIMARY KEY,
+            last_check_time TEXT,
+            last_ai_review_time TEXT,
+            daily_exits_count INTEGER DEFAULT 0,
+            last_reset_date TEXT,
+            circuit_breaker_open INTEGER DEFAULT 0,
+            consecutive_errors INTEGER DEFAULT 0,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Greeks time-series for IV crush detection
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS position_greeks_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contract_symbol TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            delta REAL,
+            gamma REAL,
+            theta REAL,
+            vega REAL,
+            iv REAL,
+            underlying_price REAL,
+            option_price REAL,
+            dte INTEGER
+        )
+    """)
+
+    # Create index for efficient lookups
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_greeks_history_contract
+        ON position_greeks_history(contract_symbol, timestamp)
+    """)
+
+    # Alert audit trail
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS monitor_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            contract_symbol TEXT,
+            alert_type TEXT,
+            severity TEXT,
+            message TEXT,
+            action_taken TEXT,
+            acknowledged INTEGER DEFAULT 0
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def get_options_monitor_state() -> dict:
+    """Get current options monitor state"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM options_monitor_state WHERE id = 1")
+    row = cursor.fetchone()
+    conn.close()
+
+    if row:
+        return dict(row)
+
+    return {
+        'last_check_time': None,
+        'last_ai_review_time': None,
+        'daily_exits_count': 0,
+        'last_reset_date': None,
+        'circuit_breaker_open': 0,
+        'consecutive_errors': 0,
+    }
+
+
+def update_options_monitor_state(
+    last_check_time: str = None,
+    last_ai_review_time: str = None,
+    daily_exits_count: int = None,
+    last_reset_date: str = None,
+    circuit_breaker_open: int = None,
+    consecutive_errors: int = None,
+):
+    """Update options monitor state"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Check if row exists
+    cursor.execute("SELECT id FROM options_monitor_state WHERE id = 1")
+    if not cursor.fetchone():
+        cursor.execute("INSERT INTO options_monitor_state (id) VALUES (1)")
+
+    # Update fields that are provided
+    if last_check_time is not None:
+        cursor.execute(
+            "UPDATE options_monitor_state SET last_check_time = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+            (last_check_time,)
+        )
+    if last_ai_review_time is not None:
+        cursor.execute(
+            "UPDATE options_monitor_state SET last_ai_review_time = ? WHERE id = 1",
+            (last_ai_review_time,)
+        )
+    if daily_exits_count is not None:
+        cursor.execute(
+            "UPDATE options_monitor_state SET daily_exits_count = ? WHERE id = 1",
+            (daily_exits_count,)
+        )
+    if last_reset_date is not None:
+        cursor.execute(
+            "UPDATE options_monitor_state SET last_reset_date = ? WHERE id = 1",
+            (last_reset_date,)
+        )
+    if circuit_breaker_open is not None:
+        cursor.execute(
+            "UPDATE options_monitor_state SET circuit_breaker_open = ? WHERE id = 1",
+            (circuit_breaker_open,)
+        )
+    if consecutive_errors is not None:
+        cursor.execute(
+            "UPDATE options_monitor_state SET consecutive_errors = ? WHERE id = 1",
+            (consecutive_errors,)
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def increment_daily_exits_count() -> int:
+    """Increment daily exits count and return new value"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE options_monitor_state
+        SET daily_exits_count = daily_exits_count + 1
+        WHERE id = 1
+    """)
+
+    cursor.execute("SELECT daily_exits_count FROM options_monitor_state WHERE id = 1")
+    row = cursor.fetchone()
+    conn.commit()
+    conn.close()
+
+    return row['daily_exits_count'] if row else 1
+
+
+def reset_options_monitor_daily(reset_date: str):
+    """Reset daily counters for new day"""
+    update_options_monitor_state(
+        daily_exits_count=0,
+        last_reset_date=reset_date,
+    )
+
+
+# Greeks History Functions
+
+def log_greeks_snapshot(
+    contract_symbol: str,
+    delta: float,
+    gamma: float,
+    theta: float,
+    vega: float,
+    iv: float,
+    underlying_price: float,
+    option_price: float,
+    dte: int
+):
+    """Log a Greeks snapshot for a position"""
+    from datetime import datetime
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO position_greeks_history
+        (contract_symbol, timestamp, delta, gamma, theta, vega, iv, underlying_price, option_price, dte)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        contract_symbol,
+        datetime.now().isoformat(),
+        delta,
+        gamma,
+        theta,
+        vega,
+        iv,
+        underlying_price,
+        option_price,
+        dte
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_entry_greeks(contract_symbol: str) -> dict:
+    """Get the entry (first) Greeks snapshot for a contract"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT * FROM position_greeks_history
+        WHERE contract_symbol = ?
+        ORDER BY timestamp ASC
+        LIMIT 1
+    """, (contract_symbol,))
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return dict(row) if row else None
+
+
+def get_latest_greeks(contract_symbol: str) -> dict:
+    """Get the latest Greeks snapshot for a contract"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT * FROM position_greeks_history
+        WHERE contract_symbol = ?
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """, (contract_symbol,))
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return dict(row) if row else None
+
+
+def get_greeks_history(contract_symbol: str, hours: int = 24) -> list:
+    """Get Greeks history for a contract over the past N hours"""
+    from datetime import datetime, timedelta
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+
+    cursor.execute("""
+        SELECT * FROM position_greeks_history
+        WHERE contract_symbol = ? AND timestamp >= ?
+        ORDER BY timestamp ASC
+    """, (contract_symbol, cutoff))
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [dict(row) for row in rows]
+
+
+def cleanup_old_greeks_history(days: int = 30):
+    """Delete Greeks history older than N days"""
+    from datetime import datetime, timedelta
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+
+    cursor.execute("""
+        DELETE FROM position_greeks_history
+        WHERE timestamp < ?
+    """, (cutoff,))
+
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+
+    return deleted
+
+
+# Alert Functions
+
+def log_monitor_alert(
+    contract_symbol: str,
+    alert_type: str,
+    severity: str,
+    message: str,
+    action_taken: str = None
+):
+    """Log an alert from the options monitor"""
+    from datetime import datetime
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO monitor_alerts
+        (timestamp, contract_symbol, alert_type, severity, message, action_taken)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        datetime.now().isoformat(),
+        contract_symbol,
+        alert_type,
+        severity,
+        message,
+        action_taken
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_recent_alerts(contract_symbol: str = None, hours: int = 24, severity: str = None) -> list:
+    """Get recent alerts, optionally filtered by contract and severity"""
+    from datetime import datetime, timedelta
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+
+    query = "SELECT * FROM monitor_alerts WHERE timestamp >= ?"
+    params = [cutoff]
+
+    if contract_symbol:
+        query += " AND contract_symbol = ?"
+        params.append(contract_symbol)
+
+    if severity:
+        query += " AND severity = ?"
+        params.append(severity)
+
+    query += " ORDER BY timestamp DESC"
+
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [dict(row) for row in rows]
+
+
+def has_recent_alert(contract_symbol: str, alert_type: str, minutes: int = 30) -> bool:
+    """Check if a similar alert was logged recently (for deduplication)"""
+    from datetime import datetime, timedelta
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cutoff = (datetime.now() - timedelta(minutes=minutes)).isoformat()
+
+    cursor.execute("""
+        SELECT COUNT(*) as cnt FROM monitor_alerts
+        WHERE contract_symbol = ? AND alert_type = ? AND timestamp >= ?
+    """, (contract_symbol, alert_type, cutoff))
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return row['cnt'] > 0 if row else False
+
+
+def acknowledge_alert(alert_id: int):
+    """Mark an alert as acknowledged"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE monitor_alerts
+        SET acknowledged = 1
+        WHERE id = ?
+    """, (alert_id,))
+
+    conn.commit()
+    conn.close()
+
+
 if __name__ == "__main__":
     # Test database
     conn = get_connection()

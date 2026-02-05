@@ -1,0 +1,17 @@
+[Unit]
+Description=Momentum Agent Flow Listener
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/momentum-agent
+ExecStart=/home/ubuntu/momentum-agent/venv/bin/python flow_listener.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=append:/home/ubuntu/momentum-agent/logs/flow_listener.log
+StandardError=append:/home/ubuntu/momentum-agent/logs/flow_listener.log
+
+[Install]
+WantedBy=multi-user.target

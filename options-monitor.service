@@ -1,0 +1,17 @@
+[Unit]
+Description=Momentum Agent Options Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/momentum-agent
+ExecStart=/home/ubuntu/momentum-agent/venv/bin/python options_monitor.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=append:/home/ubuntu/momentum-agent/logs/options_monitor.log
+StandardError=append:/home/ubuntu/momentum-agent/logs/options_monitor.log
+
+[Install]
+WantedBy=multi-user.target

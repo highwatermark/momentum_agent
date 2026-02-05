@@ -730,6 +730,96 @@ def suggest_roll(position: OptionsPosition) -> Dict:
     }
 
 
+def execute_roll(position: OptionsPosition, reason: str = "roll") -> Dict:
+    """
+    Execute a roll: close existing position and open new one at later expiration.
+
+    Args:
+        position: The position to roll
+        reason: Reason for the roll
+
+    Returns:
+        Result dict with success status, new contract details, and costs
+    """
+    # First get a roll suggestion
+    suggestion = suggest_roll(position)
+
+    if not suggestion.get("can_roll"):
+        return {
+            "success": False,
+            "error": suggestion.get("reason", "Cannot roll this position")
+        }
+
+    # Close the existing position
+    close_result = close_options_position(
+        position.contract_symbol,
+        reason=f"roll_{reason}"
+    )
+
+    if not close_result.get("success"):
+        return {
+            "success": False,
+            "error": f"Failed to close existing position: {close_result.get('error')}"
+        }
+
+    # Open the new position
+    new_contract = suggestion["new_contract"]
+    quantity = position.quantity
+
+    try:
+        # Place order for new position
+        order_result = place_options_order(
+            contract_symbol=new_contract,
+            quantity=quantity,
+            side="buy",
+            order_type="limit",
+            limit_price=suggestion["new_value"] * 1.02  # 2% buffer
+        )
+
+        if order_result.get("success"):
+            # Log the new trade
+            from db import log_options_trade
+            log_options_trade({
+                "contract_symbol": new_contract,
+                "underlying": position.symbol,
+                "option_type": position.option_type,
+                "strike": position.strike,
+                "expiration": suggestion["new_expiration"],
+                "quantity": quantity,
+                "entry_price": order_result.get("fill_price", suggestion["new_value"]),
+                "signal_score": 0,
+                "entry_reason": f"roll_from_{position.contract_symbol}",
+            })
+
+            return {
+                "success": True,
+                "old_contract": position.contract_symbol,
+                "new_contract": new_contract,
+                "new_expiration": suggestion["new_expiration"],
+                "new_dte": suggestion["new_dte"],
+                "close_price": close_result.get("exit_price", 0),
+                "open_price": order_result.get("fill_price", suggestion["new_value"]),
+                "roll_cost": suggestion["roll_cost"],
+                "quantity": quantity,
+                "pnl_from_close": close_result.get("pnl", 0),
+            }
+        else:
+            return {
+                "success": False,
+                "error": f"Failed to open new position: {order_result.get('error')}",
+                "partial": True,  # Old position was closed but new not opened
+                "close_result": close_result
+            }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Error opening new position: {e}",
+            "partial": True,
+            "close_result": close_result
+        }
+
+
 # ============== EARNINGS BLACKOUT ==============
 
 def check_earnings_blackout(symbol: str, blackout_days: int = None) -> Tuple[bool, Optional[str]]:
@@ -778,7 +868,7 @@ def get_options_positions() -> List[OptionsPosition]:
         for p in positions:
             # Check if this is an options position by looking at asset class
             asset_class = getattr(p, 'asset_class', None)
-            if asset_class and str(asset_class).lower() == 'us_option':
+            if asset_class and 'us_option' in str(asset_class).lower():
                 # Parse contract symbol to extract details
                 contract_info = parse_contract_symbol(p.symbol)
 
@@ -1467,7 +1557,19 @@ def close_options_position(
                     full_trade = get_options_trade_with_greeks(trade['id'])
                     if full_trade and full_trade.get('signal_data'):
                         import json
-                        signal_factors = json.loads(full_trade['signal_data'])
+                        signal_data = full_trade['signal_data']
+                        # Handle case where signal_data might not be valid JSON
+                        if isinstance(signal_data, str):
+                            try:
+                                signal_factors = json.loads(signal_data)
+                            except json.JSONDecodeError:
+                                # signal_data is not valid JSON, create empty dict
+                                signal_factors = {}
+                        elif isinstance(signal_data, dict):
+                            signal_factors = signal_data
+                        else:
+                            signal_factors = {}
+
                         signal_factors['option_type'] = full_trade.get('option_type')
                         signal_factors['dte'] = full_trade.get('entry_dte', 0)
 

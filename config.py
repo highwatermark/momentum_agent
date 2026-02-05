@@ -214,3 +214,102 @@ OPTIONS_SAFETY = {
     "limit_price_buffer_pct": 2.0,    # % above mid for buys
 }
 
+# Flow Listener Configuration (Real-time flow monitoring)
+FLOW_LISTENER_CONFIG = {
+    # Polling
+    "poll_interval_seconds": 60,      # Poll every 60 seconds
+
+    # Pre-filter thresholds (Layer 1 - before Claude)
+    "min_premium": 100000,            # $100K minimum premium
+    "max_signals_per_cycle": 10,      # Max signals to send to Claude
+    "excluded_symbols": ["SPXW", "SPX", "NDX", "XSP"],  # Index options to exclude
+
+    # Claude decision thresholds (Layer 2)
+    "min_conviction_execute": 75,     # Auto-execute if conviction >= 75%
+    "min_conviction_alert": 50,       # Send alert if conviction >= 50%
+
+    # Market hours (ET timezone)
+    "market_open_hour": 9,
+    "market_open_minute": 30,
+    "market_close_hour": 16,
+    "market_close_minute": 0,
+
+    # Safety limits (Layer 3 - hard limits override Claude)
+    "max_executions_per_day": 3,      # Max auto-executions per day
+    "max_delta_per_100k": 150,        # Max |delta| per $100K equity
+    "max_theta_pct": 0.003,           # Max daily theta as % of portfolio (0.3%)
+    "max_risk_score": 50,             # Max portfolio risk score (0-100)
+    "max_sector_concentration": 0.50, # Max 50% in single sector
+
+    # Operational controls
+    "enable_auto_execute": True,      # Master switch for auto-execution
+    "max_cycle_time_seconds": 55,     # Hard timeout per cycle
+
+    # Circuit breaker
+    "max_consecutive_errors": 5,      # Errors before circuit breaker opens
+    "circuit_breaker_cooldown_seconds": 300,  # 5 min cooldown
+
+    # Symbol context cache TTL (seconds)
+    "cache_ttl_earnings": 86400,      # 24 hours
+    "cache_ttl_iv_rank": 3600,        # 1 hour
+}
+
+# Options Monitor Configuration (Real-time position monitoring)
+OPTIONS_MONITOR_CONFIG = {
+    # Polling
+    "poll_interval_seconds": 45,              # Check positions every 45 seconds
+    "greeks_snapshot_interval_seconds": 300,  # Snapshot Greeks every 5 minutes
+
+    # AI Review Schedule (ET timezone)
+    "ai_review_hour": 10,             # Daily AI review at 10:00 AM ET
+    "ai_review_minute": 0,
+
+    # Market hours (same as flow listener)
+    "market_open_hour": 9,
+    "market_open_minute": 30,
+    "market_close_hour": 16,
+    "market_close_minute": 0,
+
+    # Greeks-based exit triggers
+    "gamma_risk_threshold": 0.08,     # High gamma warning threshold
+    "gamma_critical_dte": 5,          # DTE when gamma becomes critical
+    "iv_crush_threshold_pct": 20,     # IV drop % from entry to trigger alert
+    "max_portfolio_delta_per_100k": 150,  # Max |delta| per $100K equity
+    "max_daily_theta_pct": 0.003,     # Max daily theta as % of portfolio (0.3%)
+    "max_vega_exposure_pct": 0.005,   # Max vega as % of portfolio (0.5%)
+
+    # Adaptive profit targets by DTE (DTE threshold: profit target %)
+    "profit_targets_by_dte": {
+        14: 0.50,   # DTE > 14: 50% profit target
+        7: 0.40,    # DTE 7-14: 40% profit target
+        3: 0.30,    # DTE 3-7: 30% profit target
+        0: 0.20,    # DTE < 3: 20% profit target
+    },
+
+    # Stop loss (adaptive by conviction)
+    "base_stop_loss_pct": 0.50,           # Default 50% stop loss
+    "high_conviction_stop_loss_pct": 0.60,  # 60% for high-conviction trades
+
+    # Auto-exit controls
+    "enable_auto_exit": True,         # Master switch for auto-exits
+    "max_auto_exits_per_day": 5,      # Max auto-exits per day
+    "require_liquidity_check": True,  # Check liquidity before exit
+    "min_bid_for_exit": 0.05,         # Minimum bid to allow exit
+
+    # Alert deduplication
+    "alert_cooldown_minutes": 30,     # Don't repeat same alert within 30 min
+
+    # Circuit breaker
+    "max_consecutive_errors": 5,
+    "circuit_breaker_cooldown_seconds": 300,
+
+    # Theta acceleration warning
+    "theta_acceleration_threshold": 0.05,  # Daily decay > 5% of premium
+
+    # AI trigger thresholds (when to call Claude for evaluation)
+    "ai_trigger_loss_pct": 0.15,          # Losing > 15% triggers AI review
+    "ai_trigger_profit_pct": 0.30,        # Profit > 30% triggers AI review
+    "ai_trigger_dte": 7,                  # DTE <= 7 triggers AI review
+    "ai_review_cooldown_minutes": 10,     # Don't re-evaluate same trigger within 10 min
+}
+
