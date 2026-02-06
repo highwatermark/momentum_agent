@@ -160,20 +160,57 @@ OPTIONS_CONFIG = {
     "default_contracts": 1,
     "max_contracts_per_trade": 10,
     "min_premium": 50,                # Min $0.50 per contract
-    "max_premium": 1000,              # Max $10.00 per contract
-    "min_days_to_exp": 7,
-    "max_days_to_exp": 60,
-    "profit_target_pct": 0.50,        # 50% profit target
-    "stop_loss_pct": 0.50,            # 50% stop loss
+    "max_premium": 500,               # Max $5.00 per contract (reduced for liquidity)
+    "min_days_to_exp": 14,            # Minimum 14 DTE (avoid fast theta decay)
+    "max_days_to_exp": 45,            # Max 45 DTE (sweet spot)
+    "profit_target_pct": 0.50,        # 50% profit target - SIMPLE
+    "stop_loss_pct": 0.50,            # 50% stop loss - SIMPLE
+
+    # SWING TRADE STRATEGY (not scalping)
+    "min_hold_days": 2,               # Hold minimum 2 days
+    "max_hold_days": 5,               # Target 2-5 day holds
+    "no_same_day_exit": True,         # Never exit same day as entry
+
+    # ETF FILTER - Skip these (too much hedging noise, low signal-to-noise)
+    "excluded_etfs": ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLK", "XLV", "XLI", "GLD", "SLV", "TLT", "HYG", "EEM", "EFA", "VXX", "UVXY", "SQQQ", "TQQQ"],
 }
 
-# Flow Scanning Parameters
+# Flow Scanning Parameters - OPTIMIZED FOR SINGLE STOCKS
 FLOW_CONFIG = {
+    # API-level filters (applied at UW API call)
     "min_premium": 100000,            # $100K minimum flow premium
-    "min_vol_oi": 1.0,                # Vol/OI > 1
-    "min_score": 8,                   # Minimum conviction score
+    "min_vol_oi": 1.5,                # Vol/OI > 1.5
+    "all_opening": True,              # Only opening positions (CRITICAL - not closing/adjusting)
+    "min_dte": 14,                    # Minimum DTE filter (avoid theta decay)
+    "max_dte": 45,                    # Max DTE (avoid low gamma)
+    "issue_types": ["Common Stock"],  # CRITICAL - filters OUT ETFs at API level
+    "scan_limit": 30,                 # Raw alerts to fetch
+
+    # Post-filter thresholds
+    "min_score": 7,                   # Minimum conviction score (0-10 scale, only 7+)
     "max_analyze": 10,                # Max signals to analyze with Claude
-    "scan_limit": 50,                 # Raw alerts to fetch
+
+    # Quality checks
+    "min_open_interest": 500,         # Minimum OI for liquidity
+    "max_strike_distance_pct": 0.10,  # Max 10% from current price
+}
+
+# Excluded tickers - ETFs + meme/low quality stocks (hedging noise, manipulation risk)
+EXCLUDED_TICKERS = {
+    # Index ETFs
+    "SPY", "QQQ", "IWM", "DIA",
+    # Sector ETFs
+    "XLF", "XLE", "XLK", "XLV", "XLI", "XLU", "XLB", "XLC", "XLY", "XLP", "XLRE",
+    # Commodities/Bonds
+    "GLD", "SLV", "TLT", "HYG", "EEM", "EFA", "UNG",
+    # Volatility products
+    "VXX", "UVXY", "SVXY",
+    # Leveraged ETFs
+    "SQQQ", "TQQQ", "SPXU", "SPXL", "UPRO",
+    # Meme/High manipulation risk
+    "AMC", "GME", "BBBY", "MULN", "HYMC", "MMAT", "ATER", "DWAC",
+    # Low quality/penny territory risk
+    "WISH", "PLTR",  # Note: PLTR may be removed once it stabilizes
 }
 
 # Flow Signal Scoring Weights
@@ -220,9 +257,10 @@ FLOW_LISTENER_CONFIG = {
     "poll_interval_seconds": 60,      # Poll every 60 seconds
 
     # Pre-filter thresholds (Layer 1 - before Claude)
-    "min_premium": 100000,            # $100K minimum premium
+    "min_premium": 150000,            # $150K minimum premium (was $100K)
     "max_signals_per_cycle": 10,      # Max signals to send to Claude
-    "excluded_symbols": ["SPXW", "SPX", "NDX", "XSP"],  # Index options to exclude
+    # Index options always excluded (use EXCLUDED_TICKERS from config for full list)
+    "excluded_index_options": ["SPXW", "SPX", "NDX", "XSP"],
 
     # Claude decision thresholds (Layer 2)
     "min_conviction_execute": 75,     # Auto-execute if conviction >= 75%
@@ -307,9 +345,94 @@ OPTIONS_MONITOR_CONFIG = {
     "theta_acceleration_threshold": 0.05,  # Daily decay > 5% of premium
 
     # AI trigger thresholds (when to call Claude for evaluation)
-    "ai_trigger_loss_pct": 0.15,          # Losing > 15% triggers AI review
+    "ai_trigger_loss_pct": 0.35,          # Losing > 35% triggers AI review (was 0.15 - too aggressive)
     "ai_trigger_profit_pct": 0.30,        # Profit > 30% triggers AI review
     "ai_trigger_dte": 7,                  # DTE <= 7 triggers AI review
     "ai_review_cooldown_minutes": 10,     # Don't re-evaluate same trigger within 10 min
+
+    # AI advisory mode (Claude recommends, but risk framework decides)
+    "ai_advisory_only": True,             # AI recommendations feed into risk framework
+}
+
+# =============================================================================
+# RISK-BASED DECISION FRAMEWORK
+# =============================================================================
+# Replaces hard-coded counters with dynamic risk assessment.
+# Claude validates decisions based on portfolio state, conviction, and risk.
+
+RISK_FRAMEWORK = {
+    # -------------------------------------------------------------------------
+    # PORTFOLIO RISK LIMITS (caps on total exposure)
+    # -------------------------------------------------------------------------
+    "max_portfolio_delta_per_100k": 150,      # Max net |delta| per $100K equity
+    "max_portfolio_gamma_per_100k": 50,       # Max gamma concentration
+    "max_portfolio_theta_daily_pct": 0.005,   # Max daily theta burn (0.5% of portfolio)
+    "max_portfolio_vega_pct": 0.01,           # Max vega exposure (1% of portfolio)
+
+    # -------------------------------------------------------------------------
+    # CONCENTRATION LIMITS
+    # -------------------------------------------------------------------------
+    "max_sector_concentration": 0.40,         # Max 40% in one sector
+    "max_single_underlying_pct": 0.25,        # Max 25% in one ticker
+    "max_correlated_exposure": 0.50,          # Max 50% in correlated positions
+
+    # -------------------------------------------------------------------------
+    # ENTRY RISK GATES (must pass ALL to enter)
+    # -------------------------------------------------------------------------
+    "min_conviction_for_entry": 80,           # Signal conviction must be >= 80%
+    "min_risk_capacity_pct": 0.20,            # Need 20% of risk budget available
+    "max_iv_rank_for_entry": 70,              # Don't buy expensive premium (IV rank < 70)
+    "require_trend_alignment": True,          # Position must align with market trend
+    "min_dte_for_entry": 14,                  # Minimum 14 DTE for new positions
+    "max_premium_per_contract": 500,          # Max $5.00 per contract (liquidity)
+
+    # -------------------------------------------------------------------------
+    # EXIT TRIGGERS (Claude evaluates these, any can trigger exit recommendation)
+    # -------------------------------------------------------------------------
+    # P&L based (hard stops)
+    "profit_target_pct": 0.50,                # Take profit at +50%
+    "stop_loss_pct": 0.50,                    # Stop loss at -50%
+
+    # Thesis-based (Claude validates)
+    "exit_on_thesis_invalidation": True,      # Exit if original thesis no longer valid
+    "thesis_invalidation_triggers": [
+        "trend_reversal",                     # Market trend flipped against position
+        "conviction_drop",                    # Conviction dropped significantly
+        "catalyst_passed",                    # Earnings/event has passed
+        "sector_rotation",                    # Money flowing out of sector
+    ],
+
+    # Risk-based (dynamic)
+    "exit_on_gamma_risk": True,               # Exit if gamma risk too high near expiry
+    "gamma_risk_dte_threshold": 5,            # DTE below which gamma risk elevated
+    "exit_on_concentration_breach": True,     # Exit if position causes concentration breach
+
+    # Conviction-based
+    "conviction_exit_threshold": 50,          # Exit if conviction drops below 50%
+    "conviction_hold_threshold": 65,          # Hold if conviction between 50-65%
+
+    # -------------------------------------------------------------------------
+    # CLAUDE DECISION WEIGHTS (how much each factor matters)
+    # -------------------------------------------------------------------------
+    "decision_weights": {
+        "conviction_score": 0.30,             # 30% weight on signal conviction
+        "risk_capacity": 0.25,                # 25% weight on available risk budget
+        "thesis_validity": 0.25,              # 25% weight on thesis still valid
+        "technical_alignment": 0.20,          # 20% weight on technicals
+    },
+
+    # -------------------------------------------------------------------------
+    # OVERRIDE CONDITIONS (bypass normal limits)
+    # -------------------------------------------------------------------------
+    "exceptional_conviction_threshold": 90,   # Allow override if conviction >= 90%
+    "exceptional_risk_allowance": 1.25,       # Can use 125% of normal risk budget
+}
+
+# Risk scoring thresholds for portfolio health
+RISK_SCORE_THRESHOLDS = {
+    "healthy": 30,          # Risk score 0-30: healthy, can add positions
+    "cautious": 50,         # Risk score 31-50: cautious, selective entries only
+    "elevated": 70,         # Risk score 51-70: elevated, no new entries
+    "critical": 100,        # Risk score 71+: critical, consider reducing
 }
 

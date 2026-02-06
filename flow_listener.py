@@ -31,6 +31,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (
     FLOW_LISTENER_CONFIG,
     OPTIONS_CONFIG,
+    FLOW_CONFIG,
+    EXCLUDED_TICKERS,
     ANTHROPIC_API_KEY,
 )
 from flow_scanner import UnusualWhalesClient, FlowSignal, parse_flow_alert, score_flow_signal
@@ -219,8 +221,259 @@ def get_et_time() -> str:
 # CONTEXT GATHERING
 # ============================================================================
 
+def get_market_regime() -> Dict:
+    """
+    Calculate market regime based on SPY trend using SMA comparison.
+
+    This is CRITICAL for filtering counter-trend signals.
+
+    Returns:
+        Dict with trend ('bullish', 'bearish', 'sideways'), SMA values, VIX level
+    """
+    try:
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+        from config import ALPACA_API_KEY, ALPACA_SECRET_KEY
+
+        client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+        # Get SPY bars for SMA calculation (need 20+ days)
+        bars_request = StockBarsRequest(
+            symbol_or_symbols=["SPY"],
+            timeframe=TimeFrame.Day,
+            start=datetime.now() - timedelta(days=30),
+        )
+        bars = client.get_stock_bars(bars_request)
+
+        if "SPY" not in bars or len(bars["SPY"]) < 20:
+            logger.warning("Insufficient SPY data for regime calculation")
+            return {"trend": "unknown", "vix": 20}
+
+        spy_bars = bars["SPY"]
+        closes = [float(b.close) for b in spy_bars]
+
+        # Calculate SMAs
+        sma_7 = sum(closes[-7:]) / 7 if len(closes) >= 7 else closes[-1]
+        sma_20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else closes[-1]
+
+        # Current price
+        current_price = closes[-1]
+
+        # Determine trend using SMA crossover
+        # Bullish: 7-day SMA > 20-day SMA AND price above 7-day SMA
+        # Bearish: 7-day SMA < 20-day SMA AND price below 7-day SMA
+        if sma_7 > sma_20 and current_price > sma_7:
+            trend = "bullish"
+        elif sma_7 < sma_20 and current_price < sma_7:
+            trend = "bearish"
+        else:
+            trend = "sideways"
+
+        # Get VIX level
+        vix = 20  # Default
+        try:
+            uw_client = UnusualWhalesClient()
+            vix_data = uw_client.get_stock_info("VIX")
+            if vix_data and "price" in vix_data:
+                vix = float(vix_data["price"])
+        except Exception:
+            pass
+
+        return {
+            "trend": trend,
+            "sma_7": round(sma_7, 2),
+            "sma_20": round(sma_20, 2),
+            "spy_price": round(current_price, 2),
+            "vix": vix,
+            "vix_elevated": vix > 20,
+            "vix_high": vix > 25,
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting market regime: {e}")
+        return {"trend": "unknown", "vix": 20}
+
+
+def is_counter_trend(signal_option_type: str, market_regime: Dict) -> bool:
+    """
+    Check if a signal is counter-trend.
+
+    Counter-trend trades have lower win rates and should be filtered.
+
+    Args:
+        signal_option_type: 'call' or 'put'
+        market_regime: Dict with trend info
+
+    Returns:
+        True if this is a counter-trend trade
+    """
+    trend = market_regime.get("trend", "unknown")
+    option_type = signal_option_type.lower()
+
+    # Puts in bullish market = counter-trend
+    if trend == "bullish" and option_type == "put":
+        return True
+
+    # Calls in bearish market = counter-trend
+    if trend == "bearish" and option_type == "call":
+        return True
+
+    return False
+
+
+# ============================================================================
+# SIGNAL SCORING AND QUALITY CHECKS (Tighter Filtering)
+# ============================================================================
+
+def score_signal(signal, market_regime: Dict = None) -> int:
+    """
+    Score a flow signal on a 0-10 scale.
+
+    Only signals scoring 7+ should be traded.
+
+    Scoring (reward BOTH sweeps AND floor trades):
+    - Sweep: +2 (urgency indicator)
+    - Floor trade: +2 (institutional activity)
+    - Opening position: +2 (new conviction, not adjusting)
+    - Vol/OI > 2: +1, > 3: +2
+    - Premium > $250K: +1, > $500K: +2
+    - Trend-aligned: +1
+
+    Penalties:
+    - Counter-trend: -3
+    - OTM: -1
+    - IV rank > 70%: -3
+    - DTE < 14: -2, DTE 7-14: -1
+
+    Returns:
+        int: Score from 0-10
+    """
+    score = 0
+
+    # REWARD BOTH sweeps and floor trades (not mutually exclusive)
+    if getattr(signal, 'is_sweep', False) or signal.get('has_sweep', False) if isinstance(signal, dict) else getattr(signal, 'is_sweep', False):
+        score += 2
+
+    if getattr(signal, 'is_floor', False) or signal.get('has_floor', False) if isinstance(signal, dict) else getattr(signal, 'is_floor', False):
+        score += 2
+
+    # Opening position is critical (we filter for this at API level, but double-check)
+    if getattr(signal, 'is_opening', False):
+        score += 2
+
+    # Vol/OI ratio
+    vol_oi = getattr(signal, 'vol_oi_ratio', 0)
+    if vol_oi >= 3.0:
+        score += 2
+    elif vol_oi >= 1.5:
+        score += 1
+
+    # Premium size
+    premium = getattr(signal, 'premium', 0)
+    if premium >= 500000:
+        score += 2
+    elif premium >= 250000:
+        score += 1
+
+    # Trend alignment
+    if market_regime:
+        trend = market_regime.get("trend", "unknown")
+        option_type = getattr(signal, 'option_type', '').lower()
+
+        if (trend == "bullish" and option_type == "call") or \
+           (trend == "bearish" and option_type == "put"):
+            score += 1
+        elif is_counter_trend(option_type, market_regime):
+            score -= 3  # Heavy penalty for counter-trend
+
+    # Penalties
+    if getattr(signal, 'is_otm', False):
+        score -= 1
+
+    # IV rank penalty
+    iv_rank = getattr(signal, 'iv_rank', None)
+    if iv_rank is not None and iv_rank > 70:
+        score -= 3
+
+    # DTE penalty (shouldn't trigger since we filter at API level, but safety check)
+    expiration = getattr(signal, 'expiration', '')
+    if expiration:
+        try:
+            exp_date = datetime.strptime(expiration[:10], "%Y-%m-%d")
+            dte = (exp_date - datetime.now()).days
+            if dte < 7:
+                score -= 2
+            elif dte < 14:
+                score -= 1
+        except Exception:
+            pass
+
+    # Clamp to 0-10 range
+    return max(0, min(10, score))
+
+
+def passes_quality_checks(signal, market_regime: Dict = None) -> Tuple[bool, List[str]]:
+    """
+    Quality checks that MUST pass for a signal to be considered.
+
+    Checks:
+    1. Open Interest >= 500 (liquidity)
+    2. Strike within 10% of underlying price
+    3. Issue type is equity (not ETF, index, etc.)
+    4. Not in EXCLUDED_TICKERS
+    5. Not counter-trend
+    6. DTE >= 14
+
+    Returns:
+        Tuple[bool, List[str]]: (passes, list of failed check reasons)
+    """
+    failures = []
+
+    # 1. Open Interest check
+    oi = getattr(signal, 'open_interest', 0)
+    min_oi = FLOW_CONFIG.get("min_open_interest", 500)
+    if oi < min_oi:
+        failures.append(f"Low OI ({oi} < {min_oi})")
+
+    # 2. Strike distance check
+    strike = getattr(signal, 'strike', 0)
+    underlying = getattr(signal, 'underlying_price', 0)
+    max_distance = FLOW_CONFIG.get("max_strike_distance_pct", 0.10)
+
+    if underlying > 0 and strike > 0:
+        distance = abs(strike - underlying) / underlying
+        if distance > max_distance:
+            failures.append(f"Strike too far ({distance:.1%} > {max_distance:.0%})")
+
+    # 3. Excluded ticker check
+    symbol = getattr(signal, 'symbol', '').upper()
+    if symbol in EXCLUDED_TICKERS:
+        failures.append(f"Excluded ticker ({symbol})")
+
+    # 4. Counter-trend check
+    if market_regime:
+        option_type = getattr(signal, 'option_type', '').lower()
+        if is_counter_trend(option_type, market_regime):
+            failures.append("Counter-trend trade")
+
+    # 5. DTE check
+    expiration = getattr(signal, 'expiration', '')
+    min_dte = FLOW_CONFIG.get("min_dte", 14)
+    if expiration:
+        try:
+            exp_date = datetime.strptime(expiration[:10], "%Y-%m-%d")
+            dte = (exp_date - datetime.now()).days
+            if dte < min_dte:
+                failures.append(f"DTE too short ({dte} < {min_dte})")
+        except Exception:
+            pass
+
+    return len(failures) == 0, failures
+
+
 def get_market_context() -> Dict:
-    """Get current market context (SPY, VIX, etc.)"""
+    """Get current market context (SPY, VIX, etc.) with regime awareness."""
     try:
         from alpaca.data.historical.stock import StockHistoricalDataClient
         from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
@@ -229,11 +482,14 @@ def get_market_context() -> Dict:
 
         client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
+        # Get market regime first
+        regime = get_market_regime()
+
         # Get latest quotes for SPY
         quote_request = StockLatestQuoteRequest(symbol_or_symbols=["SPY"])
         quotes = client.get_stock_latest_quote(quote_request)
 
-        spy_price = 0
+        spy_price = regime.get("spy_price", 0)
         if "SPY" in quotes:
             q = quotes["SPY"]
             spy_price = (float(q.bid_price) + float(q.ask_price)) / 2
@@ -248,36 +504,21 @@ def get_market_context() -> Dict:
         bars = client.get_stock_bars(bars_request)
 
         spy_change_pct = 0
-        spy_trend = "sideways"
         if "SPY" in bars and len(bars["SPY"]) >= 2:
             prev_close = float(bars["SPY"][-2].close)
             if spy_price > 0 and prev_close > 0:
                 spy_change_pct = (spy_price - prev_close) / prev_close
 
-            # Determine trend from recent bars
-            if len(bars["SPY"]) >= 2:
-                recent_closes = [float(b.close) for b in bars["SPY"]]
-                if recent_closes[-1] > recent_closes[0]:
-                    spy_trend = "uptrend"
-                elif recent_closes[-1] < recent_closes[0]:
-                    spy_trend = "downtrend"
-
-        # VIX - try to get from UW API or use default
-        vix_level = 18.0  # Default
-        try:
-            uw_client = UnusualWhalesClient()
-            vix_data = uw_client.get_stock_info("VIX")
-            if vix_data and "price" in vix_data:
-                vix_level = float(vix_data["price"])
-        except Exception:
-            pass
-
         return {
             "spy_price": spy_price,
             "spy_change_pct": spy_change_pct,
-            "spy_trend": spy_trend,
-            "vix_level": vix_level,
-            "sector_performance": {},  # Could be expanded
+            "spy_trend": regime.get("trend", "unknown"),
+            "sma_7": regime.get("sma_7"),
+            "sma_20": regime.get("sma_20"),
+            "vix_level": regime.get("vix", 20),
+            "vix_elevated": regime.get("vix_elevated", False),
+            "vix_high": regime.get("vix_high", False),
+            "sector_performance": {},
             "current_time": get_et_time(),
         }
 
@@ -350,6 +591,29 @@ def get_portfolio_context() -> Dict:
         # Calculate available capital for new position
         available = equity * OPTIONS_CONFIG.get("position_size_pct", 0.02)
 
+        # Calculate risk capacity (new risk framework)
+        risk_capacity = max(0, 1.0 - (risk_score / 100))
+
+        # Determine risk level
+        from config import RISK_SCORE_THRESHOLDS
+        if risk_score <= RISK_SCORE_THRESHOLDS["healthy"]:
+            risk_level = "healthy"
+        elif risk_score <= RISK_SCORE_THRESHOLDS["cautious"]:
+            risk_level = "cautious"
+        elif risk_score <= RISK_SCORE_THRESHOLDS["elevated"]:
+            risk_level = "elevated"
+        else:
+            risk_level = "critical"
+
+        # Build underlying exposure map
+        underlying_exposure = {}
+        for pos in positions:
+            underlying = getattr(pos, 'symbol', 'UNKNOWN')
+            if len(underlying) > 6:
+                underlying = underlying[:4].rstrip('0123456789')
+            market_value = abs(float(getattr(pos, 'market_value', 0) or 0))
+            underlying_exposure[underlying] = underlying_exposure.get(underlying, 0) + market_value
+
         return {
             "equity": equity,
             "options_positions": position_dicts,
@@ -362,6 +626,13 @@ def get_portfolio_context() -> Dict:
             "risk_assessment": risk_assessment,
             "available_capital": available,
             "underlying_symbols": [getattr(p, 'symbol', '') for p in positions],
+            # Risk framework additions
+            "risk_capacity_pct": risk_capacity,
+            "risk_level": risk_level,
+            "portfolio_gamma": greeks.get("total_gamma", 0),
+            "portfolio_vega": greeks.get("total_vega", 0),
+            "underlying_exposure": underlying_exposure,
+            "sector_exposure": {},  # Could be enhanced later
         }
 
     except Exception as e:
@@ -385,60 +656,96 @@ def get_portfolio_context() -> Dict:
 # SAFETY GATE (Layer 3)
 # ============================================================================
 
-def safety_gate_check(signal: FlowSignal, portfolio: Dict) -> Tuple[bool, List[str]]:
+def safety_gate_check(signal: FlowSignal, portfolio: Dict, conviction: int = 0) -> Tuple[bool, List[str]]:
     """
-    Layer 3 safety checks - hard limits that override Claude.
+    RISK-BASED safety checks - dynamic limits based on portfolio state.
+
+    NO hard-coded daily limits. Instead, checks:
+    - Risk capacity (is there room for more risk?)
+    - Concentration (are we overexposed to this underlying/sector?)
+    - Greeks limits (delta, theta, gamma)
 
     Returns (can_execute, list of block reasons)
     """
-    block_reasons = []
-    config = FLOW_LISTENER_CONFIG
+    from config import RISK_FRAMEWORK, RISK_SCORE_THRESHOLDS
 
-    # 1. Master switch
+    block_reasons = []
+    warnings = []
+    config = FLOW_LISTENER_CONFIG
+    risk_config = RISK_FRAMEWORK
+
+    # 1. Master switch (keep this - it's operational, not arbitrary)
     if not config["enable_auto_execute"]:
         block_reasons.append("Auto-execute disabled")
+        return False, block_reasons
 
-    # 2. Daily limit
-    state = get_flow_listener_state()
-    if state.get("daily_execution_count", 0) >= config["max_executions_per_day"]:
-        block_reasons.append(f"Daily limit ({config['max_executions_per_day']}) reached")
-
-    # 3. Position limits
-    if portfolio["position_count"] >= portfolio["max_positions"]:
-        block_reasons.append(f"Max positions ({portfolio['max_positions']}) reached")
-
-    # 4. Delta limits
+    # Get risk metrics
     equity = portfolio.get("equity", 100000)
-    delta_per_100k = abs(portfolio.get("net_delta", 0)) / (equity / 100000) if equity > 0 else 0
-    if delta_per_100k > config["max_delta_per_100k"]:
-        block_reasons.append(f"Delta too high: {delta_per_100k:.0f} per $100K")
+    risk_score = portfolio.get("risk_score", 0)
+    equity_100k = max(equity / 100000, 0.1)
 
-    # 5. Theta limits
+    # Calculate risk capacity
+    risk_capacity = max(0, 1.0 - (risk_score / 100))
+
+    # 2. RISK CAPACITY CHECK (replaces hard daily limit)
+    min_capacity = risk_config["min_risk_capacity_pct"]
+
+    # Allow exceptional conviction to use extra capacity
+    if conviction >= risk_config["exceptional_conviction_threshold"]:
+        min_capacity = min_capacity * 0.5  # Can use half the normal minimum
+        warnings.append(f"Exceptional conviction ({conviction}%) - reduced capacity requirement")
+
+    if risk_capacity < min_capacity:
+        block_reasons.append(f"Risk capacity {risk_capacity:.0%} < {min_capacity:.0%} required")
+
+    # 3. RISK LEVEL CHECK (replaces position count limit)
+    if risk_score > RISK_SCORE_THRESHOLDS["elevated"]:
+        if conviction < risk_config["exceptional_conviction_threshold"]:
+            block_reasons.append(f"Risk level ELEVATED ({risk_score}/100) - only exceptional setups allowed")
+
+    if risk_score > RISK_SCORE_THRESHOLDS["critical"]:
+        block_reasons.append(f"Risk level CRITICAL ({risk_score}/100) - no new positions")
+
+    # 4. DELTA LIMITS (keep - this is a real risk metric)
+    delta_per_100k = abs(portfolio.get("net_delta", 0)) / equity_100k
+    max_delta = risk_config["max_portfolio_delta_per_100k"]
+    if delta_per_100k > max_delta:
+        block_reasons.append(f"Delta exposure {delta_per_100k:.0f} > {max_delta} per $100K")
+
+    # 5. THETA LIMITS (keep - this is a real risk metric)
     daily_theta_pct = abs(portfolio.get("daily_theta", 0)) / equity if equity > 0 else 0
-    if daily_theta_pct > config["max_theta_pct"]:
-        block_reasons.append(f"Theta decay too high: {daily_theta_pct:.2%}/day")
+    max_theta = risk_config["max_portfolio_theta_daily_pct"]
+    if daily_theta_pct > max_theta:
+        block_reasons.append(f"Theta decay {daily_theta_pct:.2%}/day > {max_theta:.2%} limit")
 
-    # 6. Risk score
-    if portfolio.get("risk_score", 0) > config["max_risk_score"]:
-        block_reasons.append(f"Risk score {portfolio['risk_score']} > {config['max_risk_score']}")
+    # 6. CONCENTRATION CHECK (replaces simple duplicate check)
+    max_underlying_pct = risk_config["max_single_underlying_pct"]
+    current_exposure = portfolio.get("underlying_exposure", {}).get(signal.symbol, 0)
+    exposure_pct = current_exposure / equity if equity > 0 else 0
 
-    # 7. Options exposure
-    if portfolio.get("options_exposure_pct", 0) >= OPTIONS_CONFIG.get("max_portfolio_risk_options", 0.10) * 100:
-        block_reasons.append(f"Max options exposure reached")
+    if exposure_pct > max_underlying_pct * 0.8:  # 80% of limit
+        if exposure_pct >= max_underlying_pct:
+            block_reasons.append(f"{signal.symbol} concentration {exposure_pct:.0%} >= {max_underlying_pct:.0%} limit")
+        else:
+            warnings.append(f"{signal.symbol} exposure at {exposure_pct:.0%} - approaching limit")
 
-    # 8. Duplicate position
-    if signal.symbol in portfolio.get("underlying_symbols", []):
-        block_reasons.append(f"Already hold {signal.symbol}")
-
-    # 9. Earnings blackout
+    # 7. EARNINGS BLACKOUT (keep - this is event-driven risk)
     blocked, earnings_date = check_earnings_blackout(signal.symbol)
     if blocked:
         block_reasons.append(f"Earnings blackout: {earnings_date}")
 
-    # 10. Sector concentration (via can_add_position)
-    can_add, reason = can_add_position(signal.symbol)
-    if not can_add:
-        block_reasons.append(f"Concentration: {reason}")
+    # 8. SECTOR CONCENTRATION
+    max_sector = risk_config["max_sector_concentration"]
+    sector_exposure = portfolio.get("sector_exposure", {})
+    signal_sector = getattr(signal, 'sector', 'unknown')
+    if signal_sector in sector_exposure:
+        sector_pct = sector_exposure[signal_sector] / equity if equity > 0 else 0
+        if sector_pct > max_sector:
+            block_reasons.append(f"Sector {signal_sector} at {sector_pct:.0%} > {max_sector:.0%} limit")
+
+    # Log warnings even if allowed
+    if warnings and not block_reasons:
+        logger.info(f"Safety warnings for {signal.symbol}: {warnings}")
 
     return len(block_reasons) == 0, block_reasons
 
@@ -490,14 +797,17 @@ class FlowListener:
         )
 
     def _check_daily_reset(self):
-        """Reset daily counters at midnight"""
-        today = datetime.now().date()
-        if today > self.last_reset_date:
-            logger.info(f"New day detected, resetting daily counters")
+        """Reset daily counters at midnight ET (not UTC!)"""
+        et = pytz.timezone('America/New_York')
+        now_et = datetime.now(et)
+        today_et = now_et.date()
+
+        if today_et > self.last_reset_date:
+            logger.info(f"New trading day detected (ET): {today_et}, resetting daily counters")
             self.daily_execution_count = 0
-            self.last_reset_date = today
+            self.last_reset_date = today_et
             self.seen_signal_ids.clear()
-            reset_daily_execution_count(today.isoformat())
+            reset_daily_execution_count(today_et.isoformat())
 
     def run(self):
         """Main run loop"""
@@ -564,10 +874,17 @@ class FlowListener:
         logger.debug(f"Fetching alerts newer than {newer_than}")
 
         try:
+            # API FILTERS - from config, optimized for single stocks
+            flow_config = FLOW_CONFIG
             alerts = self.uw_client.get_flow_alerts(
-                min_premium=config["min_premium"],
+                min_premium=flow_config.get("min_premium", 100000),
+                min_vol_oi_ratio=flow_config.get("min_vol_oi", 1.5),
+                all_opening=flow_config.get("all_opening", True),  # CRITICAL - only new positions
+                min_dte=flow_config.get("min_dte", 14),
+                max_dte=flow_config.get("max_dte", 45),
+                issue_types=flow_config.get("issue_types", ["Common Stock"]),  # Filters OUT ETFs
                 newer_than=newer_than,
-                limit=config["max_signals_per_cycle"] * 2,  # Fetch extra for filtering
+                limit=flow_config.get("scan_limit", 30),
             )
         except Exception as e:
             logger.error(f"UW API error: {e}")
@@ -581,27 +898,70 @@ class FlowListener:
 
         logger.info(f"Fetched {len(alerts)} raw alerts")
 
-        # Phase 2: Pre-filter and score
+        # Get market regime for counter-trend filtering
+        market_regime = get_market_regime()
+        trend = market_regime.get("trend", "unknown")
+        logger.info(f"Market regime: {trend}, VIX: {market_regime.get('vix', 'N/A')}")
+
+        # Phase 2: Pre-filter with strict quality checks and scoring
         filtered_signals = []
+        skip_stats = {
+            "counter_trend": 0,
+            "excluded_ticker": 0,
+            "short_dte": 0,
+            "low_score": 0,
+            "quality_fail": 0,
+            "dedupe": 0,
+        }
+
+        # Get minimum score threshold
+        min_score = FLOW_CONFIG.get("min_score", 7)
+        excluded_index_options = set(config.get("excluded_index_options", []))
+
         for alert in alerts:
             signal = parse_flow_alert(alert)
             if not signal:
                 continue
 
-            # Score the signal based on flow factors
-            signal = score_flow_signal(signal)
-
-            # Skip excluded symbols (index options)
-            if signal.symbol in config["excluded_symbols"]:
-                continue
-
-            # Premium filter
-            if signal.premium < config["min_premium"]:
+            # Skip index options (always excluded)
+            if signal.symbol.upper() in excluded_index_options:
+                skip_stats["excluded_ticker"] += 1
                 continue
 
             # Dedupe
             if signal.id in self.seen_signal_ids or is_signal_seen(signal.id):
+                skip_stats["dedupe"] += 1
                 continue
+
+            # Score the signal with market regime awareness
+            signal = score_flow_signal(signal, market_regime=market_regime)
+
+            # Quality checks (must pass ALL)
+            passes, fail_reasons = passes_quality_checks(signal, market_regime)
+            if not passes:
+                # Categorize the failure
+                if any("Counter-trend" in r for r in fail_reasons):
+                    skip_stats["counter_trend"] += 1
+                elif any("Excluded" in r for r in fail_reasons):
+                    skip_stats["excluded_ticker"] += 1
+                elif any("DTE" in r for r in fail_reasons):
+                    skip_stats["short_dte"] += 1
+                else:
+                    skip_stats["quality_fail"] += 1
+                logger.debug(f"Quality check failed for {signal.symbol}: {fail_reasons}")
+                continue
+
+            # Calculate signal score (0-10 scale)
+            signal_score = score_signal(signal, market_regime)
+
+            # Only accept signals with score >= 7
+            if signal_score < min_score:
+                skip_stats["low_score"] += 1
+                logger.debug(f"Low score {signal_score}/10 for {signal.symbol} (need {min_score}+)")
+                continue
+
+            # Store score on signal for later use
+            signal.score = signal_score
 
             filtered_signals.append(signal)
 
@@ -609,11 +969,18 @@ class FlowListener:
                 break
 
         if not filtered_signals:
-            logger.debug("No signals passed pre-filter")
+            skip_parts = [f"{v} {k}" for k, v in skip_stats.items() if v > 0]
+            if skip_parts:
+                logger.info(f"No signals passed filter (skipped: {', '.join(skip_parts)})")
+            else:
+                logger.debug("No signals passed filter")
             self.last_check_time = datetime.now(timezone.utc)
             return
 
-        logger.info(f"{len(filtered_signals)} signals passed pre-filter")
+        # Log what passed and what was skipped
+        skip_parts = [f"{v} {k}" for k, v in skip_stats.items() if v > 0]
+        skip_msg = f" (skipped: {', '.join(skip_parts)})" if skip_parts else ""
+        logger.info(f"{len(filtered_signals)} signals scored 7+ passed filter{skip_msg}")
 
         # Mark signals as seen
         for sig in filtered_signals:
@@ -638,6 +1005,7 @@ class FlowListener:
                 is_otm=sig.is_otm,
                 underlying_price=sig.underlying_price,
                 sentiment=sig.sentiment,
+                iv_rank=getattr(sig, 'iv_rank', None),  # Include IV rank if available
             )
             for sig in filtered_signals
         ]
@@ -660,6 +1028,12 @@ class FlowListener:
             available_capital=portfolio_ctx["available_capital"],
             position_count=portfolio_ctx["position_count"],
             max_positions=portfolio_ctx["max_positions"],
+            # Risk framework additions
+            risk_capacity_pct=portfolio_ctx.get("risk_capacity_pct", 1.0),
+            risk_level=portfolio_ctx.get("risk_level", "healthy"),
+            portfolio_gamma=portfolio_ctx.get("portfolio_gamma", 0),
+            portfolio_vega=portfolio_ctx.get("portfolio_vega", 0),
+            concentration=portfolio_ctx.get("underlying_exposure", {}),
         )
 
         logger.info("Calling Claude for validation...")
@@ -719,13 +1093,13 @@ class FlowListener:
 
     def _handle_execute(self, signal: FlowSignal, result: FlowValidationResult, portfolio: Dict):
         """Handle EXECUTE recommendation"""
-        logger.info(f"Processing EXECUTE for {signal.symbol}")
+        logger.info(f"Processing EXECUTE for {signal.symbol} (conviction: {result.conviction}%)")
 
-        # Safety gate check
-        can_execute, block_reasons = safety_gate_check(signal, portfolio)
+        # Risk-based safety gate check (passes conviction for exceptional override)
+        can_execute, block_reasons = safety_gate_check(signal, portfolio, conviction=result.conviction)
 
         if not can_execute:
-            logger.warning(f"Safety gate blocked: {block_reasons}")
+            logger.warning(f"Risk gate blocked {signal.symbol}: {block_reasons}")
             self._handle_alert(signal, result, blocked=True, block_reasons=block_reasons)
             return
 

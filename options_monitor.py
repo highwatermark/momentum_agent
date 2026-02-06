@@ -61,6 +61,7 @@ from db import (
     log_monitor_alert,
     has_recent_alert,
     cleanup_old_greeks_history,
+    get_position_entry_time,
 )
 
 # Logging setup
@@ -292,13 +293,16 @@ class OptionsMonitor:
         )
 
     def _check_daily_reset(self):
-        """Reset daily counters at midnight"""
-        today = datetime.now().date()
-        if today > self.last_reset_date:
-            logger.info("New day detected, resetting daily counters")
+        """Reset daily counters at midnight ET (not UTC!)"""
+        et = pytz.timezone('America/New_York')
+        now_et = datetime.now(et)
+        today_et = now_et.date()
+
+        if today_et > self.last_reset_date:
+            logger.info(f"New trading day detected (ET): {today_et}, resetting daily counters")
             self.daily_exits_count = 0
-            self.last_reset_date = today
-            reset_options_monitor_daily(today.isoformat())
+            self.last_reset_date = today_et
+            reset_options_monitor_daily(today_et.isoformat())
 
             # Cleanup old Greeks history
             deleted = cleanup_old_greeks_history(days=30)
@@ -404,6 +408,79 @@ class OptionsMonitor:
 
         self.circuit_breaker.record_success()
 
+    def _check_exit_allowed(self, contract_symbol: str, pnl_pct: float, reason: str = "") -> Tuple[bool, str]:
+        """
+        RISK-BASED exit check - no arbitrary hold times.
+
+        Exits are allowed based on:
+        1. Stop loss hit (-50%) - ALWAYS allowed (critical risk management)
+        2. Profit target hit (+50%) - ALWAYS allowed
+        3. Thesis invalidation - Allowed if Claude recommends
+        4. Otherwise - Claude decides based on risk/reward
+
+        Returns (allowed, explanation)
+        """
+        from config import RISK_FRAMEWORK
+
+        config = RISK_FRAMEWORK
+
+        # HARD STOPS - Always allow exit (these are risk management, not trading decisions)
+        if pnl_pct <= -config["stop_loss_pct"]:
+            return True, f"Stop loss triggered ({pnl_pct:.0%})"
+
+        if pnl_pct >= config["profit_target_pct"]:
+            return True, f"Profit target reached (+{pnl_pct:.0%})"
+
+        # For other exits, check if there's a valid reason
+        # These should be thesis-based, not time-based
+        valid_exit_reasons = [
+            "thesis_invalidation",
+            "trend_reversal",
+            "gamma_risk",
+            "iv_crush",
+            "catalyst_passed",
+            "concentration_breach",
+        ]
+
+        if reason and any(r in reason.lower() for r in valid_exit_reasons):
+            return True, f"Valid exit reason: {reason}"
+
+        # For positions not at hard stops and no valid reason, let Claude decide
+        # This replaces the arbitrary "hold for X days" rule
+        return True, "Exit decision delegated to Claude"
+
+    def _get_position_age_days(self, contract_symbol: str) -> int:
+        """Get how many days a position has been held (for context, not as a hard rule)."""
+        try:
+            entry_time = get_position_entry_time(contract_symbol)
+            if entry_time is None:
+                return 0
+
+            if isinstance(entry_time, str):
+                entry_time = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
+
+            if entry_time.tzinfo is None:
+                entry_time = entry_time.replace(tzinfo=pytz.UTC)
+
+            et = pytz.timezone('America/New_York')
+            now_et = datetime.now(et)
+            entry_et = entry_time.astimezone(et)
+
+            return (now_et.date() - entry_et.date()).days
+        except Exception:
+            return 0
+
+    def _check_minimum_hold_time(self, contract_symbol: str) -> bool:
+        """
+        DEPRECATED: Now always returns True.
+        Hold time is no longer a hard rule - Claude decides based on thesis validity.
+
+        Kept for backwards compatibility but effectively disabled.
+        """
+        # No longer enforcing arbitrary hold times
+        # Exit decisions are based on risk/reward, not time
+        return True
+
     def _evaluate_position(self, pos, portfolio_greeks: Dict, equity: float):
         """
         Evaluate a position and call Claude if action may be needed.
@@ -423,6 +500,11 @@ class OptionsMonitor:
         current_price = float(getattr(pos, 'current_price', 0) or 0)
 
         dte = self._calculate_dte(expiration)
+
+        # Check minimum hold time - skip AI review if position too new (unless critical DTE)
+        if dte > 1 and not self._check_minimum_hold_time(contract_symbol):
+            logger.debug(f"[{underlying}] Skipping evaluation - minimum hold time not met")
+            return
 
         # Get current Greeks
         try:
@@ -554,12 +636,21 @@ class OptionsMonitor:
             self._rules_based_fallback(pos, trigger_reason, dte, unrealized_plpc)
 
     def _execute_ai_decision(self, pos, result, trigger_reason: str) -> Optional[str]:
-        """Execute Claude's decision immediately"""
+        """Execute Claude's decision - advisory mode makes this alert-only"""
         contract_symbol = getattr(pos, 'symbol', 'UNKNOWN')
         underlying = contract_symbol[:4].rstrip('0123456789') if len(contract_symbol) > 10 else contract_symbol
 
+        # Check if AI is in advisory-only mode
+        ai_advisory_only = OPTIONS_MONITOR_CONFIG.get("ai_advisory_only", True)
+
         # CLOSE - Exit the position
         if result.recommendation == 'CLOSE':
+            # In advisory mode, only auto-exit on CRITICAL urgency
+            if ai_advisory_only and result.urgency != 'critical':
+                logger.info(f"[{underlying}] AI recommends CLOSE but advisory mode - sending alert")
+                self._send_telegram_ai_recommendation(underlying, result)
+                return None
+
             if self._can_auto_exit():
                 success = self._execute_exit(pos, f"ai_{trigger_reason}")
                 if success:
@@ -570,6 +661,12 @@ class OptionsMonitor:
 
         # ROLL - Close and reopen at later expiration
         elif result.recommendation == 'ROLL':
+            # In advisory mode, always alert for rolls (require human confirmation)
+            if ai_advisory_only:
+                logger.info(f"[{underlying}] AI recommends ROLL but advisory mode - sending alert")
+                self._send_telegram_ai_recommendation(underlying, result)
+                return None
+
             if self._can_auto_exit():
                 roll_result = self._execute_roll_for_position(pos, result, trigger_reason)
                 if roll_result:

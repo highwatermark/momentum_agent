@@ -20,6 +20,8 @@ from config import (
     OPTIONS_SAFETY,
     TRADING_CONFIG,
     FLOW_LISTENER_CONFIG,
+    RISK_FRAMEWORK,
+    RISK_SCORE_THRESHOLDS,
 )
 
 # Configure logging
@@ -1334,10 +1336,10 @@ class FlowSignalInput:
     is_opening: bool
     is_otm: bool
     underlying_price: float
-    sentiment: str  # 'bullish' or 'bearish'
+    sentiment: str  # 'bullish', 'bearish', or 'neutral'
     # Symbol context
     days_to_earnings: int = 999
-    iv_rank: float = 50.0
+    iv_rank: float = None  # IV rank (0-100), None if unknown
     sector: str = "unknown"
 
 
@@ -1363,6 +1365,12 @@ class FlowValidationInput:
     available_capital: float
     position_count: int
     max_positions: int
+    # Risk Framework (new - dynamic risk assessment)
+    risk_capacity_pct: float = 1.0          # Remaining risk budget (0-1)
+    risk_level: str = "healthy"             # healthy/cautious/elevated/critical
+    portfolio_gamma: float = 0.0            # Total gamma exposure
+    portfolio_vega: float = 0.0             # Total vega exposure
+    concentration: Dict[str, float] = None  # Exposure by underlying
 
 
 @dataclass
@@ -1377,6 +1385,7 @@ class FlowValidationResult:
     suggested_contracts: int
     profit_target: str
     stop_loss: str
+    conviction_breakdown: str = ""  # How conviction was calculated
 
 
 def validate_flow_signals(
@@ -1416,6 +1425,13 @@ def _validate_with_agent(validation_input: FlowValidationInput) -> Optional[List
         opening_tag = " [OPENING]" if sig.is_opening else ""
         otm_tag = " [OTM]" if sig.is_otm else ""
 
+        # Format IV rank with warning if high
+        iv_rank_str = f"{sig.iv_rank:.0f}" if sig.iv_rank is not None else "N/A"
+        if sig.iv_rank is not None and sig.iv_rank > 70:
+            iv_rank_str += " [HIGH - EXPENSIVE PREMIUM]"
+        elif sig.iv_rank is not None and sig.iv_rank > 50:
+            iv_rank_str += " [ELEVATED]"
+
         signals_text += f"""
 Signal {i} (ID: {sig.signal_id}):
 - Symbol: {sig.symbol}
@@ -1426,7 +1442,7 @@ Signal {i} (ID: {sig.signal_id}):
 - Underlying: ${sig.underlying_price:.2f}
 - Sentiment: {sig.sentiment}
 - Earnings: {sig.days_to_earnings} days away
-- IV Rank: {sig.iv_rank:.0f}
+- IV Rank: {iv_rank_str}
 - Sector: {sig.sector}
 """
 
@@ -1440,59 +1456,138 @@ Signal {i} (ID: {sig.signal_id}):
     else:
         positions_text = "  (no current positions)"
 
+    # Get risk level description
+    risk_level = validation_input.risk_level if hasattr(validation_input, 'risk_level') else "healthy"
+    risk_capacity = validation_input.risk_capacity_pct if hasattr(validation_input, 'risk_capacity_pct') else 1.0
+
+    # Format concentration data
+    concentration_text = ""
+    if hasattr(validation_input, 'concentration') and validation_input.concentration:
+        top_exposures = sorted(validation_input.concentration.items(), key=lambda x: -x[1])[:5]
+        concentration_text = "\n".join(f"  - {sym}: ${val:,.0f}" for sym, val in top_exposures)
+    else:
+        concentration_text = "  (no current exposure)"
+
     # Build prompt
-    prompt = f"""CURRENT MARKET CONTEXT:
-- SPY: ${validation_input.spy_price:.2f} ({validation_input.spy_change_pct:+.1%}), Trend: {validation_input.spy_trend}
-- VIX: {validation_input.vix_level:.1f}
+    prompt = f"""=== MARKET CONTEXT ===
+- SPY: ${validation_input.spy_price:.2f} ({validation_input.spy_change_pct:+.1%})
+- Market Trend: {validation_input.spy_trend.upper()}
+- VIX: {validation_input.vix_level:.1f} {'[ELEVATED]' if validation_input.vix_level > 20 else '[NORMAL]'}
 - Time: {validation_input.current_time}
 
-PORTFOLIO CONTEXT:
-- Equity: ${validation_input.equity:,.0f}
-- Current Options Positions: {validation_input.position_count}/{validation_input.max_positions}
-{positions_text}
-- Net Delta: {validation_input.net_delta:.0f}
-- Daily Theta: ${validation_input.daily_theta:.0f}
-- Options Exposure: {validation_input.options_exposure_pct:.1f}%
-- Risk Score: {validation_input.risk_score}/100 ({validation_input.risk_assessment})
-- Available for new position: ~${validation_input.available_capital:,.0f}
+=== RISK FRAMEWORK STATE ===
+- Risk Level: {risk_level.upper()}
+- Risk Score: {validation_input.risk_score}/100
+- Risk Capacity: {risk_capacity:.0%} available
+- Can Add Positions: {'YES' if risk_capacity > 0.1 else 'NO - AT CAPACITY'}
 
-SIGNALS TO ANALYZE:
+=== PORTFOLIO GREEKS ===
+- Net Delta: {validation_input.net_delta:.0f}
+- Total Gamma: {getattr(validation_input, 'portfolio_gamma', 0):.2f}
+- Daily Theta: ${validation_input.daily_theta:.0f}
+- Total Vega: {getattr(validation_input, 'portfolio_vega', 0):.2f}
+
+=== CURRENT POSITIONS ({validation_input.position_count}) ===
+{positions_text}
+
+=== CONCENTRATION ===
+{concentration_text}
+
+=== CAPITAL ===
+- Equity: ${validation_input.equity:,.0f}
+- Options Exposure: {validation_input.options_exposure_pct:.1f}%
+- Available for New Position: ~${validation_input.available_capital:,.0f}
+
+=== SIGNALS TO EVALUATE ===
 {signals_text}
 
-For each signal, provide a JSON object with:
-- signal_id: string (the ID from the signal)
-- symbol: string
-- recommendation: "EXECUTE" | "ALERT" | "SKIP"
-- conviction: 0-100 (75+ for EXECUTE, 50-74 for ALERT, <50 for SKIP)
-- thesis: Profit-focused reasoning (why this trade or why not)
-- risk_factors: list of concerns
-- suggested_contracts: 1-5 (0 if SKIP)
-- profit_target: target like "50%" or specific price
-- stop_loss: stop like "50%" or specific condition
+=== YOUR TASK ===
 
-Return a JSON array ranked by execution priority. Focus on PROFIT POTENTIAL."""
+For each signal, calculate your CONVICTION score using the factors in your instructions.
+Show your work: list the positive and negative factors, then sum to get conviction.
 
-    system_prompt = """You are an autonomous options flow trading agent. Your PRIMARY OBJECTIVE is to
-GENERATE PROFITS by identifying and executing high-conviction options trades
-based on unusual institutional flow.
+Risk capacity is {risk_capacity:.0%} - {'you can take new positions' if risk_capacity > 0.2 else 'BE VERY SELECTIVE' if risk_capacity > 0.1 else 'NO NEW POSITIONS ALLOWED'}.
 
-PROFIT MANDATE:
-- You are measured by P/L performance
-- Capital preservation is important, but excessive caution destroys returns
-- The best traders have ~40-50% win rate with 2:1+ reward/risk ratio
-- Missing a profitable trade is as costly as taking a losing trade
-- Act decisively on high-conviction signals
+For each signal, provide a JSON object:
+{{
+  "signal_id": "the ID",
+  "symbol": "TICKER",
+  "recommendation": "EXECUTE" | "ALERT" | "SKIP",
+  "conviction": 0-100,
+  "conviction_breakdown": "list factors: +15 sweep, +10 floor, -10 IV rank = 85%",
+  "thesis": "Clear thesis explaining the EDGE (not just describing the flow)",
+  "risk_factors": ["list", "of", "risks"],
+  "suggested_contracts": 0-3,
+  "profit_target": "+50%",
+  "stop_loss": "-50%"
+}}
 
-DECISION FRAMEWORK:
-- EXECUTE: High conviction (75%+), clear institutional signal, favorable risk/reward
-- ALERT: Interesting signal worth human review (50-74% conviction)
-- SKIP: Low conviction, unclear thesis, or unfavorable conditions (<50%)
+REMEMBER: EXECUTE only if conviction >= 80% AND risk capacity >= 20%.
+Return ONLY valid JSON array."""
 
-PORTFOLIO-AWARE DECISIONS:
-- Consider current delta exposure when adding directional trades
-- Avoid concentration in single sector or underlying
-- Factor in existing theta decay when adding positions
-- Respect position limits but don't be overly conservative
+    system_prompt = """You are an AUTONOMOUS OPTIONS TRADING AGENT with full decision authority.
+Your decisions are based on RISK CAPACITY and CONVICTION, not arbitrary rules.
+
+=== RISK-BASED DECISION FRAMEWORK ===
+
+You make decisions based on THREE factors:
+1. RISK CAPACITY - How much risk budget is available (provided in context)
+2. CONVICTION - Your assessment of the trade's probability of success
+3. THESIS VALIDITY - Is there a clear, logical reason for this trade
+
+There are NO hard-coded limits like "max 3 trades per day" or "hold 2 days minimum".
+Instead, you evaluate RISK vs REWARD dynamically.
+
+=== ENTRY DECISION LOGIC ===
+
+WHEN TO EXECUTE:
+- Risk capacity >= 20% AND conviction >= 80% AND thesis is clear
+- Exceptional setups (conviction >= 90%) can use up to 125% of normal risk budget
+- Trend-aligned trades require LOWER conviction than counter-trend
+
+WHEN TO SKIP:
+- Risk capacity < 10% (portfolio is at limit)
+- Conviction < 65% (not enough edge)
+- No clear thesis (just "unusual activity" is not enough)
+- IV rank > 70% without specific catalyst (expensive premium)
+
+CONVICTION FACTORS (use these to calculate your conviction score):
++15: Strong sweep activity with size
++10: Floor/institutional trade
++10: Opening position (not closing)
++10: Vol/OI > 3x (significant new positioning)
++10: Trend-aligned (calls in uptrend, puts in downtrend)
+-15: Counter-trend (requires exceptional other factors)
+-10: IV rank > 60% (expensive premium)
+-10: Near earnings without clear thesis
+-5:  DTE < 14 (elevated theta)
+-5:  OTM (lower probability)
+
+=== RISK CAPACITY RULES ===
+
+The RISK_LEVEL tells you how aggressive you can be:
+- HEALTHY (risk score 0-30): Normal operations, can take new positions
+- CAUTIOUS (31-50): Be selective, require higher conviction (+10%)
+- ELEVATED (51-70): Very selective, only exceptional setups
+- CRITICAL (71+): No new positions, focus on risk reduction
+
+=== POSITION SIZING ===
+
+Base size on conviction AND risk capacity:
+- Conviction 90%+ with healthy risk: 2-3 contracts
+- Conviction 80-89%: 1-2 contracts
+- Conviction 70-79%: 1 contract (ALERT only)
+- Lower conviction: 0 contracts (SKIP)
+
+Scale DOWN if:
+- Already exposed to same underlying
+- Same sector concentration > 30%
+- Portfolio delta already directionally loaded
+
+=== OUTPUT FORMAT ===
+
+For each signal, provide conviction score and clear thesis.
+Your thesis should explain WHY this trade has edge, not just describe the flow.
 
 Return ONLY valid JSON array, no other text."""
 
@@ -1529,6 +1624,7 @@ Return ONLY valid JSON array, no other text."""
                 suggested_contracts=item.get("suggested_contracts", 0),
                 profit_target=item.get("profit_target", "50%"),
                 stop_loss=item.get("stop_loss", "50%"),
+                conviction_breakdown=item.get("conviction_breakdown", ""),
             )
             results.append(result)
 

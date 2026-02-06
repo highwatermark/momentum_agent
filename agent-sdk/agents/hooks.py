@@ -3,16 +3,29 @@ Safety hooks for AI-Native Options Flow Trading System.
 
 These hooks enforce safety constraints that CANNOT be bypassed by agents.
 They run before and after tool execution to ensure compliance.
+
+Key Features:
+- Shadow mode enforcement (blocks real trades when enabled)
+- Daily execution limits
+- Circuit breaker on consecutive losses
+- Position count limits
 """
 import logging
+import os
 from datetime import datetime, date
 from typing import Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 
 import pytz
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 ET = pytz.timezone("America/New_York")
+
+# Shadow mode from environment or config
+SHADOW_MODE = os.getenv("AGENT_SDK_SHADOW_MODE", "false").lower() in ("true", "1", "yes")
 
 
 @dataclass
@@ -27,18 +40,20 @@ class ExecutionState:
     circuit_breaker_until: Optional[datetime] = None
 
     def reset_daily(self):
-        """Reset daily counters."""
-        today = date.today()
-        if self.last_execution_date != today:
+        """Reset daily counters at ET midnight (not UTC!)."""
+        et = pytz.timezone('America/New_York')
+        today_et = datetime.now(et).date()
+        if self.last_execution_date != today_et:
             self.executions_today = 0
             self.daily_pnl = 0.0
-            self.last_execution_date = today
+            self.last_execution_date = today_et
 
     def record_execution(self):
         """Record a successful execution."""
         self.reset_daily()
         self.executions_today += 1
-        self.last_execution_date = date.today()
+        et = pytz.timezone('America/New_York')
+        self.last_execution_date = datetime.now(et).date()
 
     def record_loss(self, amount: float):
         """Record a loss for circuit breaker logic."""
@@ -88,6 +103,7 @@ class PreToolUseHook:
     Hook that runs BEFORE tool execution.
 
     Enforces safety constraints that agents cannot bypass.
+    Includes shadow mode enforcement to block real trades.
     """
 
     # Tools that require safety checks
@@ -100,6 +116,8 @@ class PreToolUseHook:
         self.max_positions = config.get("max_positions", 4)
         self.max_spread_pct = config.get("max_spread_pct", 0.15)
         self.earnings_blackout_days = config.get("earnings_blackout_days", 2)
+        # Shadow mode can be set via config or environment
+        self.shadow_mode = config.get("shadow_mode", SHADOW_MODE)
 
     def __call__(self, tool_name: str, tool_params: Dict[str, Any]) -> HookResult:
         """
@@ -108,6 +126,14 @@ class PreToolUseHook:
         Returns HookResult indicating if the tool call should proceed.
         """
         execution_state.reset_daily()
+
+        # SHADOW MODE CHECK - blocks all execution tools
+        if self.shadow_mode and tool_name in self.EXECUTION_TOOLS:
+            logger.warning(f"[SHADOW MODE] Blocked {tool_name}: {tool_params}")
+            return HookResult(
+                allowed=False,
+                reason=f"SHADOW MODE: {tool_name} blocked. Would have executed: {tool_params.get('symbol', 'N/A')}"
+            )
 
         # Check circuit breaker for any trading tool
         if tool_name in self.EXECUTION_TOOLS:
@@ -127,6 +153,15 @@ class PreToolUseHook:
 
         # Allow all other tools
         return HookResult(allowed=True)
+
+    def is_shadow_mode(self) -> bool:
+        """Check if shadow mode is currently enabled."""
+        return self.shadow_mode
+
+    def set_shadow_mode(self, enabled: bool):
+        """Enable or disable shadow mode."""
+        self.shadow_mode = enabled
+        logger.info(f"Shadow mode {'ENABLED' if enabled else 'DISABLED'}")
 
     def _check_place_order(self, params: Dict[str, Any]) -> HookResult:
         """Validate place_order calls."""
@@ -284,11 +319,13 @@ class SafetyGateHook:
     Combined hook for comprehensive safety enforcement.
 
     This is the main hook to use - it combines pre and post hooks.
+    Includes shadow mode support for testing without real execution.
     """
 
     def __init__(self, config: Dict[str, Any], telegram_notifier=None):
         self.pre_hook = PreToolUseHook(config)
         self.post_hook = PostToolUseHook(config, telegram_notifier)
+        self.config = config
 
     def pre_tool_use(self, tool_name: str, tool_params: Dict[str, Any]) -> HookResult:
         """Called before tool execution."""
@@ -307,7 +344,16 @@ class SafetyGateHook:
             "positions_count": execution_state.positions_count,
             "daily_pnl": execution_state.daily_pnl,
             "circuit_breaker_open": execution_state.circuit_breaker_open,
+            "shadow_mode": self.pre_hook.is_shadow_mode(),
         }
+
+    def is_shadow_mode(self) -> bool:
+        """Check if shadow mode is enabled."""
+        return self.pre_hook.is_shadow_mode()
+
+    def set_shadow_mode(self, enabled: bool):
+        """Enable or disable shadow mode."""
+        self.pre_hook.set_shadow_mode(enabled)
 
 
 def reset_daily_state():

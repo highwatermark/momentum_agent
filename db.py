@@ -3191,6 +3191,32 @@ def log_greeks_snapshot(
     conn.close()
 
 
+def get_position_entry_time(contract_symbol: str) -> str:
+    """
+    Get the entry time for a position from options_trades table.
+
+    Args:
+        contract_symbol: Full OCC contract symbol
+
+    Returns:
+        ISO formatted entry_date string, or None if not found
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT entry_date FROM options_trades
+        WHERE contract_symbol = ? AND status = 'open'
+        ORDER BY entry_date DESC
+        LIMIT 1
+    """, (contract_symbol,))
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return row['entry_date'] if row else None
+
+
 def get_entry_greeks(contract_symbol: str) -> dict:
     """Get the entry (first) Greeks snapshot for a contract"""
     conn = get_connection()
